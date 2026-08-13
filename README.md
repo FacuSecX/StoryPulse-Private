@@ -1090,3 +1090,8 @@ El acceso a perfiles privados depende exclusivamente de los permisos de la cuent
 StoryPulse no evita controles de privacidad de Instagram y no proporciona acceso a contenido que la cuenta autenticada no pueda visualizar normalmente.
 
 El comportamiento relacionado con visualizaciones de Stories, endpoints internos y mecanismos de Instagram puede cambiar en cualquier momento.
+
+
+## 🚧 PROYECTO EN CONSTRUCCIÓN
+>
+> **El código fuente y los archivos del proyecto todavía no fueron publicados.**
