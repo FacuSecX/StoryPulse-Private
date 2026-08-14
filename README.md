@@ -3,6 +3,7 @@
 <p align="center">
 <img src="http://imgfz.com/i/Y7U30MS.png" title="StoryPulse">
 </p>
+<br></br>
 
 
 <p align="center">
