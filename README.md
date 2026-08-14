@@ -1,5 +1,9 @@
 # StoryPulse Private
 
+<p align="center">
+<img src="http://imgfz.com/i/Y7U30MS.png" title="StoryPulse">
+</p>
+
 
 <p align="center">
 <a href="https://github.com/FacuSecX"><img title="Autor" src="https://img.shields.io/badge/Author-Facu%20-blue?style=for-the-badge&logo=github"></a>
@@ -1092,6 +1096,11 @@ StoryPulse no evita controles de privacidad de Instagram y no proporciona acceso
 El comportamiento relacionado con visualizaciones de Stories, endpoints internos y mecanismos de Instagram puede cambiar en cualquier momento.
 
 
-## 🚧 PROYECTO EN CONSTRUCCIÓN
->
-> **El código fuente y los archivos del proyecto todavía no fueron publicados.**
+## Instalacion en servidores
+
+```text
+chmod +x setup_server.sh
+sudo ./setup_server.sh
+```
+
+
