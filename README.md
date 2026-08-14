@@ -1101,9 +1101,11 @@ El comportamiento relacionado con visualizaciones de Stories, endpoints internos
 
 ## Instalacion en servidores
 
+En el servidor ejecuta
+
 ```text
-chmod +x setup_server.sh
-sudo ./setup_server.sh
+chmod +x server_install.sh
+sudo ./server_install.sh
 ```
 
 
