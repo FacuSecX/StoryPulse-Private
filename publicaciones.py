@@ -1,10 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-
-# Bot Telegram StoryPulse v1.0
-# https://github.com/FacuSecX/
-
+# StoryPulse v2.0
+# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
 
 from __future__ import annotations
@@ -12,7 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -22,21 +17,20 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from PIL import Image
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 import database as db
+from history import comprobar_perfil_accesible
+from instagram_sessions import (
+    ejecutar_con_sesiones, obtener_ruta_sesion, guardar_estado_contexto,
+    usar_playwright_sincronico,
+    validar_respuesta_instagram, validar_pagina_instagram, validar_datos_instagram,
+    ErrorSesionInstagram, ErrorConsultaInstagram, PerfilNoEncontrado, PerfilPrivado,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-
-STATE_ENV = os.getenv(
-    "INSTAGRAM_STORAGE_STATE",
-    "instagram_state.json",
-).strip()
-STATE_PATH = Path(STATE_ENV).expanduser()
-if not STATE_PATH.is_absolute():
-    STATE_PATH = BASE_DIR / STATE_PATH
 
 HISTORYS_DIR = Path(
     os.getenv("HISTORYS_DIR", "/historys")
@@ -171,17 +165,19 @@ def leer_json_respuesta(page, response) -> dict[str, Any]:
         try:
             data = json.loads(texto)
         except Exception as exc:
-            raise RuntimeError(
+            raise ErrorConsultaInstagram(
                 "Instagram no devolvió JSON válido en publicaciones."
             ) from exc
 
+    validar_datos_instagram(data)
+
     if not isinstance(data, dict):
-        raise RuntimeError(
+        raise ErrorConsultaInstagram(
             "La respuesta GraphQL de publicaciones no es un objeto JSON."
         )
 
     if data.get("errors"):
-        raise RuntimeError(
+        raise ErrorConsultaInstagram(
             "Instagram devolvió un error GraphQL en publicaciones."
         )
 
@@ -528,6 +524,7 @@ def descubrir_publicaciones_por_scroll(
     respuestas_timeline = 0
     encontro_conocido = False
     total_detectado = total_objetivo
+    errores_sesion: list[Exception] = []
 
     def reportar_scroll() -> None:
         if progress_callback is None:
@@ -563,7 +560,13 @@ def descubrir_publicaciones_por_scroll(
             return
 
         try:
+            # El listener registra el fallo; el bucle lo propaga fuera del callback.
+            validar_respuesta_instagram(page, response, "paginar publicaciones")
             data = response.json()
+            validar_datos_instagram(data)
+        except (ErrorSesionInstagram, PerfilNoEncontrado) as error:
+            errores_sesion.append(error)
+            return
         except Exception:
             return
 
@@ -606,13 +609,12 @@ def descubrir_publicaciones_por_scroll(
             timeout=60000,
         )
 
-        if response is not None and response.status in (401, 403):
-            raise RuntimeError(
-                "Instagram rechazó la sesión al abrir el perfil "
-                f"(HTTP {response.status})."
-            )
+        validar_respuesta_instagram(page, response, f"abrir @{username}")
 
         page.wait_for_timeout(2500)
+        validar_pagina_instagram(page)
+        if errores_sesion:
+            raise errores_sesion[0]
 
         try:
             texto_perfil = page.locator("body").inner_text(timeout=5000)
@@ -674,6 +676,9 @@ def descubrir_publicaciones_por_scroll(
                 )"""
             )
             page.wait_for_timeout(SCROLL_WAIT_MS)
+            validar_pagina_instagram(page)
+            if errores_sesion:
+                raise errores_sesion[0]
 
             try:
                 medidas = page.evaluate(
@@ -929,13 +934,7 @@ def extraer_medios_publicacion(
 
 
 def guardar_state_atomico(context) -> None:
-    temporal = STATE_PATH.with_suffix(
-        STATE_PATH.suffix + ".tmp"
-    )
-    context.storage_state(
-        path=str(temporal)
-    )
-    temporal.replace(STATE_PATH)
+    guardar_estado_contexto(context)
 
 
 def _guardar_imagen_jpg(
@@ -1018,6 +1017,31 @@ def descargar_publicaciones(
     chat_id: int,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> ResultadoPublicaciones:
+    """Prueba las sesiones y conserva las descargas de intentos parciales."""
+    username = normalizar_username(username)
+    parciales: list[dict[str, Any]] = []
+    resultado = ejecutar_con_sesiones(username, lambda: _descargar_publicaciones_sesion(
+        username, chat_id, progress_callback, parciales,
+    ))
+    # SQLite evita repetir archivos ya descargados por una sesión anterior.
+    # También deben figurar como nuevos en el resumen de esta misma operación.
+    guardadas_anteriores = tuple(post for parcial in parciales for post in parcial["guardadas"])
+    nuevas_anteriores = len(guardadas_anteriores)
+    return replace(resultado,
+        publicaciones_nuevas=resultado.publicaciones_nuevas + nuevas_anteriores,
+        archivos_nuevos=resultado.archivos_nuevos + sum(len(p.archivos) for p in guardadas_anteriores),
+        publicaciones_ya_descargadas=max(0, resultado.publicaciones_ya_descargadas - nuevas_anteriores),
+        consultas_graphql=resultado.consultas_graphql + sum(p["consultas"] for p in parciales),
+        guardadas=guardadas_anteriores + resultado.guardadas,
+    )
+
+
+def _descargar_publicaciones_sesion(
+    username: str,
+    chat_id: int,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    parciales: list[dict[str, Any]],
+) -> ResultadoPublicaciones:
     """
     Descarga publicaciones de un perfil.
 
@@ -1037,11 +1061,6 @@ def descargar_publicaciones(
 
     username = normalizar_username(username)
     chat_id = int(chat_id)
-
-    if not STATE_PATH.exists():
-        raise FileNotFoundError(
-            f"Falta {STATE_PATH.name}"
-        )
 
     carpeta = HISTORYS_DIR / username / "publicaciones"
     carpeta.mkdir(parents=True, exist_ok=True)
@@ -1115,10 +1134,10 @@ def descargar_publicaciones(
 
     reportar_progreso("iniciando")
 
-    with sync_playwright() as p:
+    with usar_playwright_sincronico(sync_playwright) as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            storage_state=str(STATE_PATH),
+            storage_state=str(obtener_ruta_sesion()),
             viewport={"width": 1365, "height": 900},
             locale="es-AR",
             timezone_id=str(TZ.key),
@@ -1183,7 +1202,7 @@ def descargar_publicaciones(
                         )
 
                         if not respuesta_media.ok:
-                            raise RuntimeError(
+                            raise ErrorConsultaInstagram(
                                 "CDN de Instagram respondió "
                                 f"HTTP {respuesta_media.status}."
                             )
@@ -1269,25 +1288,21 @@ def descargar_publicaciones(
             )
             consultas_graphql += 1
 
-            if response is None:
-                raise RuntimeError(
-                    "Instagram no devolvió respuesta GraphQL de publicaciones."
-                )
-            if response.status in (401, 403):
-                raise RuntimeError(
-                    "Instagram rechazó la sesión "
-                    f"(HTTP {response.status})."
-                )
-            if response.status == 429:
-                raise RuntimeError(
-                    "Instagram respondió 429 / rate limit."
-                )
+            validar_respuesta_instagram(page, response, f"consultar publicaciones de @{username}")
 
             data = leer_json_respuesta(page, response)
             nodes, page_info, _ruta = encontrar_conexion_publicaciones(data)
             total_perfil = extraer_total_publicaciones(data)
             reportar_progreso("leyendo_perfil")
 
+            if not nodes:
+                # No marcar completo un perfil privado que esta cuenta no puede ver.
+                comprobar_perfil_accesible(username)
+                if total_perfil != 0:
+                    raise ErrorConsultaInstagram(
+                        "No se pudo confirmar que el perfil tenga cero publicaciones; "
+                        "la sincronización queda pendiente."
+                    )
             conocidos_primero, _ = procesar_lote(nodes)
             guardar_state_atomico(context)
             page.close()
@@ -1387,11 +1402,13 @@ def descargar_publicaciones(
 
             reportar_progreso("terminado")
 
+        except (ErrorSesionInstagram, ErrorConsultaInstagram, PerfilPrivado,
+                PerfilNoEncontrado, PlaywrightTimeoutError):
+            parciales.append({"guardadas": tuple(guardadas), "consultas": consultas_graphql})
+            raise
         finally:
-            try:
-                guardar_state_atomico(context)
-            except Exception:
-                pass
+            # No sobrescribir una sesión válida con cookies de una respuesta fallida.
+            context.close()
             browser.close()
 
     return ResultadoPublicaciones(
@@ -1408,4 +1425,3 @@ def descargar_publicaciones(
         corte_por_antirepeticion=corte_por_antirepeticion,
         guardadas=tuple(guardadas),
     )
-
