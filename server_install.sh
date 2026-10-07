@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 
 # ============================================================
-# StoryPulse Private - Instalador Linux
+# StoryPulse Private v2.0 - Instalador Linux
 # ============================================================
 # Diseñado para ejecutarse desde la raíz del repositorio.
 #
@@ -60,7 +61,7 @@ echo
 if [[ "${EUID}" -ne 0 ]]; then
     die "Necesitás ejecutar este instalador como usuario root.
 Ejemplo:
-    sudo bash setup_server.sh"
+    sudo bash server_install.sh"
 fi
 
 green "✓ Permisos root confirmados"
@@ -72,7 +73,7 @@ if [[ ! -f "$SOURCE_DIR/bot.py" ]]; then
     die "No encuentro bot.py junto al instalador."
 fi
 
-for required in history.py publicaciones.py database.py requirements.txt .env.example; do
+for required in history.py publicaciones.py database.py highlights.py instagram_sessions.py crear_session.py crearsession.py requirements.txt .env.example; do
     [[ -f "$SOURCE_DIR/$required" ]] || die "Falta $required en $SOURCE_DIR"
 done
 
@@ -199,6 +200,9 @@ PUBLIC_FILES=(
     "history.py"
     "publicaciones.py"
     "database.py"
+    "highlights.py"
+    "instagram_sessions.py"
+    "crear_session.py"
     "crearsession.py"
     "requirements.txt"
     ".env.example"
@@ -207,6 +211,12 @@ PUBLIC_FILES=(
 OPTIONAL_FILES=(
     "README.md"
     ".gitignore"
+    "probar_sesion_vps.py"
+    "probar_motor.py"
+    "renovar_session_vps.py"
+    "RENOVAR_SESSION.bat"
+    "renovar_session_vps.config.ejemplo.json"
+    "sesiones_instagram.example.json"
 )
 
 for file in "${PUBLIC_FILES[@]}"; do
@@ -221,6 +231,17 @@ done
 
 chown -R "$APP_USER:$APP_GROUP" "$APP_HOME"
 chmod 750 "$APP_HOME" "$APP_DIR"
+
+# Preservar sesiones existentes y limitar el acceso a sus archivos privados.
+for private_file in instagram_state.json sesiones_instagram.json estado_sesiones_instagram.json; do
+    if [[ -f "$APP_DIR/$private_file" ]]; then
+        chmod 600 "$APP_DIR/$private_file"
+    fi
+done
+if [[ -d "$APP_DIR/sesiones_instagram" ]]; then
+    chmod 700 "$APP_DIR/sesiones_instagram"
+    find "$APP_DIR/sesiones_instagram" -maxdepth 1 -type f -name '*.json' -exec chmod 600 {} +
+fi
 
 green "✓ Proyecto instalado en: $APP_DIR"
 
@@ -456,6 +477,8 @@ cat > "$APP_DIR/.env" <<EOF
 TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN
 TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
 INSTAGRAM_STORAGE_STATE=instagram_state.json
+INSTAGRAM_SESSIONS_CONFIG=sesiones_instagram.json
+INSTAGRAM_SESSIONS_REGISTRY=estado_sesiones_instagram.json
 HISTORYS_DIR=$STORAGE_DIR
 STORYPULSE_PANEL_URL=$PANEL_URL
 STORYPULSE_TIMEZONE=$STORYPULSE_TZ
@@ -530,9 +553,12 @@ echo
 echo "Configuración privada:"
 echo "  $APP_DIR/.env"
 echo
-echo "Sesión de Instagram:"
-echo "  Copiá instagram_state.json a:"
-echo "  $APP_DIR/instagram_state.json"
+echo "Sesiones de Instagram (multi-autenticación):"
+echo "  Copiá sesiones_instagram.json y los JSON que referencia a:"
+echo "  $APP_DIR/"
+echo "  Conservá las rutas relativas, incluida la carpeta sesiones_instagram/."
+echo "  La sesión anterior instagram_state.json sigue siendo compatible."
+echo "  Los archivos de sesión y su configuración son privados; no van a GitHub."
 echo
 echo "Servicio StoryPulse:"
 echo "  systemctl status ${SERVICE_NAME}"
@@ -557,8 +583,17 @@ if [[ "$INSTALL_FB" == "s" || "$INSTALL_FB" == "si" || "$INSTALL_FB" == "sí" ||
 fi
 
 yellow "IMPORTANTE:"
-echo "  instagram_state.json NO se crea en el servidor."
-echo "  Generá la sesión en un equipo con interfaz gráfica usando crearsession.py"
-echo "  y copiá solamente instagram_state.json al directorio del proyecto."
+echo "  Generá las sesiones en un equipo con interfaz gráfica, mediante login manual:"
+echo "    python crear_session.py"
+echo "  Eso crea la sesión principal compatible con la versión anterior."
+echo "  Para añadir otra cuenta autenticada:"
+echo "    python crear_session.py --cuenta USERNAME_DE_LA_CUENTA"
+echo "  Transferí sesiones_instagram.json y TODOS los archivos JSON habilitados"
+echo "  que referencia, conservando sus carpetas dentro de $APP_DIR."
+echo "  No transfieras los perfiles completos del navegador."
+echo "  Asigná sus permisos al usuario $APP_USER y limitá los JSON a chmod 600."
+echo "  El registro estado_sesiones_instagram.json se genera automáticamente."
+echo "  Reiniciá el bot tras copiar las sesiones: systemctl restart $SERVICE_NAME"
+echo "  crearsession.py se mantiene como acceso compatible a crear_session.py."
 echo
-green "StoryPulse Private listo."
+green "StoryPulse Private v2.0 listo."
