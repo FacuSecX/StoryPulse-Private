@@ -1,5 +1,5 @@
-# Bot Telegram StoryPulse v1.0
-# https://github.com/FacuSecX/
+# StoryPulse v2.0
+# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
 
 
@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import unicodedata
+import uuid
 from datetime import datetime, time as dt_time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -44,12 +45,24 @@ from history import (
     PerfilPrivado,
     SinHistoriasDisponibles,
     comprobar_perfil_accesible,
+    comprobar_perfiles_desde_pagina,
     comprobar_sesion_local,
     descargar_historias,
     limpiar_username,
     resolver_user_id,
 )
 from publicaciones import descargar_publicaciones
+from highlights import (
+    SinHistoriasDestacadas,
+    descargar_destacadas,
+)
+from instagram_sessions import (
+    listar_sesiones, usar_sesion, obtener_ruta_sesion,
+    estado_sesiones_local, SesionesAgotadas, ErrorSesionInstagram,
+    ConfiguracionSesionesError, obtener_vinculo, cambiar_sesion_preferida,
+    verificar_accesos_perfil, ejecutar_con_sesiones, sesion_actual,
+    listar_sesiones_nuevas, actualizar_accesos_sesion,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -60,18 +73,7 @@ HISTORYS_DIR = Path(
     os.getenv("HISTORYS_DIR", "/historys")
 ).expanduser()
 
-_instagram_state_env = os.getenv(
-    "INSTAGRAM_STORAGE_STATE",
-    "instagram_state.json",
-).strip()
-INSTAGRAM_STATE_PATH = Path(_instagram_state_env).expanduser()
-if not INSTAGRAM_STATE_PATH.is_absolute():
-    INSTAGRAM_STATE_PATH = BASE_DIR / INSTAGRAM_STATE_PATH
-
-PANEL_URL = os.getenv(
-    "STORYPULSE_PANEL_URL",
-    "https://tupanel.com/",
-).strip()
+PANEL_URL = os.getenv("STORYPULSE_PANEL_URL", "").strip()
 TZ = ZoneInfo(
     os.getenv(
         "STORYPULSE_TIMEZONE",
@@ -107,6 +109,12 @@ SCHED_COUNT = "sched_count"
 SCHED_TIMES = "sched_times"
 SCHED_INTERVAL_HOURS = "sched_interval_hours"
 SCHED_INTERVAL_MINUTE = "sched_interval_minute"
+SCHED_MODALIDAD = "sched_modalidad"
+SCHED_SESIONES = "sched_sesiones"
+SCHED_SESIONES_DETECTADAS = "sched_sesiones_detectadas"
+SCHED_SELECCION_TOKENS = "sched_seleccion_tokens"
+SCHED_SELECCION_MESSAGE_ID = "sched_seleccion_message_id"
+SCHED_SESIONES_ELEGIDAS = "sched_sesiones_elegidas"
 
 
 def autorizado(update: Update) -> bool:
@@ -154,7 +162,7 @@ def _formatear_antiguedad_segundos(segundos: float) -> str:
 
 def _antiguedad_archivo_sesion() -> str:
     try:
-        modificado = INSTAGRAM_STATE_PATH.stat().st_mtime
+        modificado = obtener_ruta_sesion().stat().st_mtime
     except OSError:
         return "no disponible"
 
@@ -166,7 +174,7 @@ def _antiguedad_archivo_sesion() -> str:
 def _cookie_storage_state(nombre: str) -> str | None:
     try:
         data = json.loads(
-            INSTAGRAM_STATE_PATH.read_text(encoding="utf-8")
+            obtener_ruta_sesion().read_text(encoding="utf-8")
         )
     except Exception:
         return None
@@ -260,182 +268,206 @@ def _username_de_html_por_id(
 
 
 def _comprobar_sesion_web_real() -> dict[str, object]:
-    """
-    Comprueba la sesión contra la portada/feed de Instagram.
-
-    """
+    """Abre únicamente la portada y exige señales visibles del feed autenticado."""
     comprobar_sesion_local()
-
-    if not INSTAGRAM_STATE_PATH.exists():
-        raise FileNotFoundError(
-            f"No existe {INSTAGRAM_STATE_PATH}."
-        )
-
     ds_user_id = _cookie_storage_state("ds_user_id")
     usernames: list[str] = []
-    estados_http_problematicos: list[int] = []
-
-   
-    
+    ruta = obtener_ruta_sesion()
     try:
-        estado_completo = json.loads(
-            INSTAGRAM_STATE_PATH.read_text(encoding="utf-8")
+        username = _username_de_objeto_por_id(
+            json.loads(ruta.read_text(encoding="utf-8")), ds_user_id,
         )
-        username_estado = _username_de_objeto_por_id(
-            estado_completo,
-            ds_user_id,
-        )
-        if username_estado:
-            usernames.append(username_estado)
-    except Exception:
+        if username:
+            usernames.append(username)
+    except (OSError, ValueError):
         pass
+
+    # No buscar palabras sueltas en las publicaciones: una descripción puede
+    # mencionar CAPTCHA o challenge sin que la sesión tenga ningún problema.
+    comprobar_dom = r"""() => {
+        const visible = el => !!el && el.getClientRects().length > 0 &&
+            getComputedStyle(el).visibility !== 'hidden';
+        const visibles = selector => Array.from(document.querySelectorAll(selector)).filter(visible);
+        const texto = el => (el.innerText || el.textContent || '').trim();
+        const navegacion = visibles('a[href*="/direct/inbox"], a[href*="/accounts/edit"], a[href*="/explore/"]');
+        const publicaciones = visibles('article, main [role="article"], [role="main"] [role="article"]');
+        const historias = visibles('a[href^="/stories/"]').filter(el =>
+            !el.closest('article, [role="article"]'));
+        const titulos = visibles('h1, h2, [role="dialog"], form').filter(el =>
+            !el.closest('article, [role="article"]')).map(texto);
+        const alertas = visibles('[role="alert"]').filter(el =>
+            !el.closest('article, [role="article"]')).map(texto);
+        const login = visibles('input[name="password"], input[type="password"]').length > 0;
+        const captcha = visibles('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], form[action*="/challenge"], form[action*="/checkpoint"]').length > 0;
+        const vacio = visibles('main h1, main h2, [role="main"] h1, [role="main"] h2').some(el =>
+            /^(you['’]re all caught up|ya est[aá]s al d[ií]a|est[aá]s al d[ií]a|welcome to instagram|te damos la bienvenida a instagram)[.!]?$/i.test(texto(el)));
+        return {navegacion: navegacion.length > 0, publicaciones: publicaciones.length,
+            historias: historias.length, feed_vacio: vacio, login, captcha,
+            titulos, alertas};
+    }"""
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(
-            storage_state=str(INSTAGRAM_STATE_PATH),
-            viewport={"width": 1365, "height": 900},
-            locale="es-AR",
-            timezone_id=str(getattr(TZ, "key", "America/Argentina/Buenos_Aires")),
-        )
-
+        context = None
         try:
+            context = browser.new_context(
+                storage_state=str(ruta),
+                viewport={"width": 1365, "height": 900},
+                locale="es-AR",
+                timezone_id=str(getattr(TZ, "key", "America/Argentina/Buenos_Aires")),
+            )
             page = context.new_page()
 
             def procesar_response(response) -> None:
+                # Respuestas opcionales fallidas no invalidan un feed visible.
+                # Se leen datos ya recibidos para identificar la cuenta; no se
+                # hacen consultas adicionales de Stories ni de publicaciones.
                 try:
-                    if "instagram.com" not in response.url.lower():
+                    if not re.match(r"https://(?:[a-z0-9-]+\.)?instagram\.com/", response.url, re.I):
                         return
-
-                    if response.status in (400, 401, 403, 429):
-                        estados_http_problematicos.append(
-                            int(response.status)
-                        )
-
-                    ctype = (
-                        response.headers.get("content-type", "")
-                        or ""
-                    ).lower()
-                    if "json" not in ctype:
+                    if response.status != 200 or "json" not in response.headers.get("content-type", "").lower():
                         return
-
-                    data = response.json()
-                    username = _username_de_objeto_por_id(
-                        data,
-                        ds_user_id,
-                    )
+                    username = _username_de_objeto_por_id(response.json(), ds_user_id)
                     if username and username not in usernames:
                         usernames.append(username)
                 except Exception:
-                    return
-
-            page.on("response", procesar_response)
-
-            response = page.goto(
-                "https://www.instagram.com/",
-                wait_until="domcontentloaded",
-                timeout=60_000,
-            )
-
-            if response is None:
-                raise RuntimeError(
-                    "Instagram no devolvió respuesta al abrir el feed."
-                )
-
-            estado_http = int(response.status)
-            if estado_http >= 400:
-                raise RuntimeError(
-                    f"Instagram respondió HTTP {estado_http} al abrir el feed."
-                )
-
-            page.wait_for_timeout(3_500)
-
-            url_final = page.url.lower()
-            rutas_bloqueo = (
-                "/accounts/login",
-                "/challenge/",
-                "/checkpoint/",
-                "/auth_platform/",
-                "/accounts/confirm_email",
-                "/accounts/confirm_phone",
-            )
-
-            if "/accounts/login" in url_final:
-                raise RuntimeError(
-                    "Instagram redirigió al login. La sesión web ya no es válida."
-                )
-
-            if any(ruta in url_final for ruta in rutas_bloqueo[1:]):
-                raise RuntimeError(
-                    "Instagram abrió una verificación/challenge. "
-                    "La sesión requiere intervención manual."
-                )
-
-            try:
-                texto_pagina = page.locator("body").inner_text(
-                    timeout=5_000
-                ).casefold()
-            except Exception:
-                texto_pagina = ""
-
-            indicadores_bloqueo = (
-                "no soy un robot",
-                "i'm not a robot",
-                "confirm it's you",
-                "confirma que eres tú",
-                "confirma que sos vos",
-                "código de seguridad",
-                "security code",
-                "actividad sospechosa",
-                "suspicious activity",
-                "suspendimos tu cuenta",
-                "we suspended your account",
-            )
-
-            if any(
-                indicador in texto_pagina
-                for indicador in indicadores_bloqueo
-            ):
-                raise RuntimeError(
-                    "Instagram mostró una verificación de seguridad/CAPTCHA. "
-                    "La sesión requiere intervención manual."
-                )
-
-            if not usernames:
-                try:
-                    username_html = _username_de_html_por_id(
-                        page.content(),
-                        ds_user_id,
-                    )
-                    if username_html:
-                        usernames.append(username_html)
-                except Exception:
                     pass
 
-            # Un 400/401/403/429 en una respuesta interna durante la carga es
-            # relevante para el diagnóstico, aunque la navegación principal haya
-            # devuelto 200. No usamos 404 porque Instagram genera algunos recursos
-            # opcionales con 404 sin invalidar la sesión.
-            
-            internos = sorted(set(estados_http_problematicos))
-            if any(codigo in (400, 401, 403, 429) for codigo in internos):
-                raise RuntimeError(
-                    "Instagram devolvió una respuesta interna de autenticación "
-                    f"HTTP {', '.join(map(str, internos))}."
+            page.on("response", procesar_response)
+            respuesta = page.goto(
+                "https://www.instagram.com/", wait_until="domcontentloaded", timeout=40_000,
+            )
+            if respuesta is None:
+                raise RuntimeError("Instagram no devolvió respuesta al abrir el feed.")
+            estado_http = int(respuesta.status)
+            if estado_http >= 400:
+                raise RuntimeError(f"Instagram respondió HTTP {estado_http} al abrir el feed.")
+
+            limite = time.monotonic() + 15
+            for _ in range(21):
+                url = page.url.casefold()
+                if "/accounts/login" in url:
+                    raise RuntimeError("Instagram redirigió al login. La sesión necesita actualizarse.")
+                if any(ruta_bloqueo in url for ruta_bloqueo in (
+                    "/challenge", "/checkpoint", "/auth_platform/", "/accounts/confirm_email", "/accounts/confirm_phone",
+                )):
+                    raise RuntimeError("Instagram abrió un checkpoint/CAPTCHA. La sesión necesita verificación manual.")
+
+                dom = page.evaluate(comprobar_dom)
+                if not isinstance(dom, dict):
+                    dom = {}
+                if dom.get("login"):
+                    raise RuntimeError("Instagram mostró el login. La sesión necesita actualizarse.")
+                if dom.get("captcha"):
+                    raise RuntimeError("Instagram mostró un CAPTCHA. La sesión necesita verificación manual.")
+
+                titulos = "\n".join(str(item).casefold() for item in dom.get("titulos", []))
+                indicadores_verificacion = (
+                    "confirm it's you", "confirm it’s you", "confirma que eres tú",
+                    "confirma que sos vos", "ayúdanos a confirmar que eres tú",
+                    "confirma tu identidad", "verifica tu identidad", "confirm your identity",
+                    "help us confirm you own this account", "enter your security code",
+                    "ingresa el código de seguridad", "introduce el código de seguridad",
+                    "suspendimos tu cuenta", "we suspended your account",
+                    "demuestra que eres una persona", "prove you're human", "prove you’re human",
+                    "confirma que no eres un robot", "confirm you're human", "confirm you’re human",
                 )
+                if any(indicador in titulos for indicador in indicadores_verificacion):
+                    raise RuntimeError("Instagram mostró una verificación de seguridad. La sesión necesita verificación manual.")
 
-            return {
-                "ok": True,
-                "http_status": estado_http,
-                "username": usernames[0] if usernames else None,
-                "user_id": ds_user_id,
-                "url_final": page.url,
-                "antiguedad_archivo": _antiguedad_archivo_sesion(),
-            }
+                feed_visible = bool(re.fullmatch(r"https://(?:www\.)?instagram\.com/?(?:[?#].*)?", url)
+                    and dom.get("navegacion") and (
+                    dom.get("publicaciones") or dom.get("historias") or dom.get("feed_vacio")
+                ))
+                alertas = "\n".join(str(item).casefold() for item in dom.get("alertas", []))
+                # Un aviso explícito de fallo del feed invalida una carga
+                # parcial, aunque ya haya publicaciones renderizadas.
+                if any(indicador in alertas for indicador in (
+                    "couldn't refresh feed", "couldn’t refresh feed", "no se pudo actualizar el feed",
+                )):
+                    raise RuntimeError("Instagram mostró un error y no cargó el feed normalmente.")
+                # La portada debe mostrar contenido además de navegación: un
+                # HTTP 200 o la presencia de cookies por sí solos no bastan.
+                if feed_visible:
+                    if not usernames:
+                        try:
+                            username = _username_de_html_por_id(page.content(), ds_user_id)
+                        except Exception:
+                            username = None
+                        if username:
+                            usernames.append(username)
+                    return {
+                        "ok": True, "http_status": estado_http,
+                        "username": usernames[0] if usernames else None,
+                        "user_id": ds_user_id, "url_final": page.url,
+                        "antiguedad_archivo": _antiguedad_archivo_sesion(),
+                    }
 
+                if any(indicador in alertas for indicador in (
+                    "something went wrong", "se produjo un error", "try again later", "inténtalo de nuevo más tarde",
+                )):
+                    raise RuntimeError("Instagram mostró un error y no cargó el feed normalmente.")
+                if time.monotonic() >= limite:
+                    break
+                page.wait_for_timeout(750)
+            raise RuntimeError("No se pudo confirmar el feed autenticado. La sesión necesita actualización o revisión.")
         finally:
-            context.close()
+            if context is not None:
+                context.close()
             browser.close()
+
+
+def _tipo_error_estado_feed(error: Exception) -> str:
+    if isinstance(error, ErrorSesionInstagram):
+        return error.tipo
+    if isinstance(error, (FileNotFoundError, json.JSONDecodeError)):
+        return "archivo"
+    texto = str(error).casefold()
+    if any(valor in texto for valor in ("login", "iniciar sesión", "inicie sesión", "http 401")):
+        return "login"
+    if any(valor in texto for valor in (
+        "captcha", "recaptcha", "challenge", "checkpoint", "verificación", "verification", "robot",
+    )):
+        return "verificacion"
+    if "429" in texto or "rate limit" in texto or "too many requests" in texto:
+        return "rate_limit"
+    if "400" in texto:
+        return "http_400"
+    if "403" in texto:
+        return "rechazada"
+    return "feed"
+
+
+def _estado_sesiones_feed(progress_callback=None, detener=None) -> list[dict[str, object]]:
+    """Diagnóstico al pulsar Estado, independiente del historial de descargas."""
+    resultados: list[dict[str, object]] = []
+    sesiones = listar_sesiones()
+    for indice, sesion in enumerate(sesiones, 1):
+        if detener is not None and detener.is_set():
+            break
+        base = {"id": sesion.id, "username": sesion.username, "etiqueta": sesion.etiqueta}
+        if progress_callback:
+            progress_callback({"actual": base, "procesadas": indice - 1, "total": len(sesiones)})
+        try:
+            # No consultar _indisponibilidad ni registrar éxitos/errores aquí:
+            # un error histórico no determina este diagnóstico del feed.
+            with usar_sesion(sesion):
+                remoto = _comprobar_sesion_web_real()
+            if remoto.get("ok") is not True:
+                raise RuntimeError("No se pudo confirmar el feed autenticado.")
+            resultado = {
+                **base, "disponible": True, "ultimo_error_tipo": None,
+                "detalle": "Feed autenticado visible; sesión correcta.", "remoto": remoto,
+            }
+        except Exception as error:
+            resultado = {
+                **base, "disponible": False, "ultimo_error_tipo": _tipo_error_estado_feed(error),
+                "detalle": str(error) or "El feed no se pudo comprobar.",
+            }
+        resultados.append(resultado)
+        if progress_callback:
+            progress_callback({"actual": base, "procesadas": indice, "total": len(sesiones)})
+    return resultados
 
 
 def registrar_mensaje_limpiable(
@@ -549,6 +581,17 @@ def diagnosticar_error(error: Exception) -> tuple[str, str, str]:
     texto = str(error)
     bajo = texto.lower()
 
+    if isinstance(error, ConfiguracionSesionesError):
+        return ("📄", "CONFIGURACIÓN DE SESIONES", "Revisá sesiones_instagram.json y el registro de sesiones.")
+    if isinstance(error, SesionesAgotadas):
+        return ("🔐", "NINGUNA SESIÓN DISPONIBLE",
+                "Revisá los archivos JSON y los últimos errores. CAPTCHA y login requieren renovación manual de la sesión afectada.")
+    if isinstance(error, ErrorSesionInstagram) and error.tipo == "verificacion":
+        return ("🔐", "VERIFICACIÓN DE INSTAGRAM",
+                "Completá la verificación manualmente y exportá de nuevo la sesión afectada.")
+    if isinstance(error, ErrorSesionInstagram) and error.tipo == "http_400":
+        return ("⚠️", "INSTAGRAM RECHAZÓ LA CONSULTA (HTTP 400)",
+                "Instagram rechazó esta consulta. Revisá el último error registrado y el archivo JSON de esa sesión.")
     if (
         "429" in bajo
         or "rate limit" in bajo
@@ -557,10 +600,10 @@ def diagnosticar_error(error: Exception) -> tuple[str, str, str]:
     ):
         return (
             "🚦",
-            "RATE LIMIT / límite temporal de Instagram",
+            "LÍMITE DE INSTAGRAM",
             (
-                "No fuerces nuevas consultas inmediatamente. "
-                "Dejá que la próxima programación vuelva a intentar."
+                "Instagram informó un límite para esta consulta. "
+                "Revisá el último rechazo registrado para esa sesión."
             ),
         )
 
@@ -782,9 +825,11 @@ def cargar_cuentas() -> list[dict]:
 
             resultado.append(
                 {
+                    **item,
                     "nombre": nombre,
                     "username": username,
                     "user_id": user_id,
+                    "destacada": item.get("destacada") is True,
                 }
             )
 
@@ -848,18 +893,98 @@ def buscar_cuenta(username: str):
 
 
 def actualizar_user_id(username: str, user_id: int) -> None:
-    cuentas = cargar_cuentas()
-    cambio = False
+    with CUENTAS_LOCK:
+        cuentas = cargar_cuentas()
+        cambio = False
 
-    for cuenta in cuentas:
-        if cuenta["username"].casefold() == username.casefold():
-            if cuenta.get("user_id") != int(user_id):
-                cuenta["user_id"] = int(user_id)
-                cambio = True
-            break
+        for cuenta in cuentas:
+            if cuenta["username"].casefold() == username.casefold():
+                if cuenta.get("user_id") != int(user_id):
+                    cuenta["user_id"] = int(user_id)
+                    cambio = True
+                break
 
-    if cambio:
+        if cambio:
+            guardar_cuentas(cuentas)
+
+
+def boton_cuenta(cuenta: dict, texto: str, callback_data: str) -> InlineKeyboardButton:
+    """El estilo normal se conserva cuando el perfil no está destacado."""
+    estilo = {"style": "primary"} if cuenta.get("destacada") is True else {}
+    return InlineKeyboardButton(texto, callback_data=callback_data, **estilo)
+
+
+def alternar_cuenta_destacada(username: str) -> bool:
+    username = limpiar_username(username)
+    with CUENTAS_LOCK:
+        cuentas = cargar_cuentas()
+        cuenta = next((c for c in cuentas if c["username"] == username), None)
+        if cuenta is None:
+            raise ValueError("Ese perfil ya no está en las cuentas agregadas.")
+        cuenta["destacada"] = not cuenta.get("destacada", False)
         guardar_cuentas(cuentas)
+        return cuenta["destacada"]
+
+
+def menu_cuentas_destacadas() -> InlineKeyboardMarkup:
+    botones = [boton_cuenta(c, f"{'⭐' if c.get('destacada') else '☆'} {c['nombre']} (@{c['username']})",
+                            f"highlight_toggle:{c['username']}") for c in cargar_cuentas()]
+    filas = [botones[i:i + 2] for i in range(0, len(botones), 2)]
+    filas.append([InlineKeyboardButton("‹ Gestión de cuentas", callback_data="manage")])
+    return InlineKeyboardMarkup(filas)
+
+
+def menu_perfiles_sesion_preferida() -> InlineKeyboardMarkup:
+    botones = [boton_cuenta(c, f"👤 {c['nombre']} (@{c['username']})",
+                            f"pref_profile:{c['username']}") for c in cargar_cuentas()]
+    filas = [botones[i:i + 2] for i in range(0, len(botones), 2)]
+    filas.append([InlineKeyboardButton("‹ Gestión de cuentas", callback_data="manage")])
+    return InlineKeyboardMarkup(filas)
+
+
+def nombres_sesiones(sesiones) -> dict[str, str | None]:
+    """Identificar principal comparando ds_user_id con cuentas conocidas, sin red."""
+    nombres = {s.id: s.username for s in sesiones}
+    if all(nombres.values()):
+        return nombres
+    conocidas = {}
+    pendientes = []
+    for sesion in sesiones:
+        try:
+            data = json.loads(sesion.archivo.read_text(encoding="utf-8-sig"))
+            uid = next((c.get("value") for c in data.get("cookies", [])
+                        if isinstance(c, dict) and c.get("name") == "ds_user_id"), None)
+        except (OSError, ValueError, TypeError, AttributeError):
+            uid = None
+        if not isinstance(uid, str) or not uid:
+            uid = None
+        if uid and sesion.username:
+            conocidas[uid] = sesion.username
+        if not sesion.username:
+            pendientes.append((sesion.id, uid))
+    for identificador, uid in pendientes:
+        if uid in conocidas:
+            nombres[identificador] = conocidas[uid]
+    return nombres
+
+
+def menu_elegir_sesion_preferida(username: str, context, message_id=None) -> InlineKeyboardMarkup:
+    sesiones = listar_sesiones()
+    nombres = nombres_sesiones(sesiones)
+    preferida = (obtener_vinculo(username) or {}).get("sesion_id")
+    elecciones = {}
+    filas = []
+    for sesion in sesiones:
+        token = uuid.uuid4().hex[:12]
+        elecciones[token] = sesion
+        nombre = f"@{nombres[sesion.id]}" if nombres.get(sesion.id) else "Usuario sin identificar"
+        actual = "✅ " if sesion.id == preferida else ""
+        filas.append([InlineKeyboardButton(f"{actual}{nombre} · {sesion.id}", callback_data=f"pref_pick:{token}")])
+    context.user_data["preferencia_seleccion"] = {
+        "username": username, "message_id": message_id, "elecciones": elecciones,
+    }
+    filas.append([InlineKeyboardButton("‹ Elegir otro perfil", callback_data="pref_accounts")])
+    return InlineKeyboardMarkup(filas)
 
 
 def menu_principal() -> InlineKeyboardMarkup:
@@ -879,6 +1004,13 @@ def menu_principal() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 "📥 DESCARGAR PUBLICACIONES",
                 callback_data="publications_menu",
+                style="success",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✨ HISTORIAS DESTACADAS",
+                callback_data="highlights_menu",
                 style="success",
             )
         ],
@@ -946,7 +1078,8 @@ def menu_revisar_historias() -> InlineKeyboardMarkup:
 
     for cuenta in cargar_cuentas():
         botones.append(
-            InlineKeyboardButton(
+            boton_cuenta(
+                cuenta,
                 f"👤 {cuenta['nombre']}",
                 callback_data=f"review:{cuenta['username']}",
             )
@@ -978,7 +1111,8 @@ def menu_publicaciones() -> InlineKeyboardMarkup:
 
     for cuenta in cargar_cuentas():
         botones.append(
-            InlineKeyboardButton(
+            boton_cuenta(
+                cuenta,
                 f"🖼 {cuenta['nombre']}",
                 callback_data=(
                     f"publications:{cuenta['username']}"
@@ -1052,6 +1186,24 @@ def menu_gestion() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    "⭐ Destacar cuentas",
+                    callback_data="highlight_accounts",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔑 Cambiar sesión preferida",
+                    callback_data="pref_accounts",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 Actualizar sesiones",
+                    callback_data="sessions_update",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "♻️ Reiniciar antirepetición",
                     callback_data="dedupe_reset_menu",
                     style="danger",
@@ -1075,7 +1227,8 @@ def menu_reiniciar_antirepeticion() -> InlineKeyboardMarkup:
 
     for cuenta in cargar_cuentas():
         botones.append(
-            InlineKeyboardButton(
+            boton_cuenta(
+                cuenta,
                 f"♻️ {cuenta['nombre']}",
                 callback_data=(
                     f"dedupe_reset_select:{cuenta['username']}"
@@ -1097,6 +1250,30 @@ def menu_reiniciar_antirepeticion() -> InlineKeyboardMarkup:
         ]
     )
 
+    return InlineKeyboardMarkup(filas)
+
+
+ANTIREPETICION_TIPOS = {
+    "todo": ("todo", "Resetear todo"),
+    "pub": ("publicaciones", "Resetear publicaciones"),
+    "hist": ("historias", "Resetear historias"),
+    "dest": ("destacadas", "Resetear historias destacadas"),
+}
+
+
+def menu_tipos_antirepeticion(username: str) -> InlineKeyboardMarkup:
+    """El alcance se elige después del perfil, antes de confirmar."""
+    filas = [
+        [InlineKeyboardButton(
+            etiqueta,
+            callback_data=f"dedupe_reset_type:{username}:{codigo}",
+            style="danger" if codigo == "todo" else None,
+        )]
+        for codigo, (_tipo, etiqueta) in ANTIREPETICION_TIPOS.items()
+    ]
+    filas.append([InlineKeyboardButton(
+        "‹ Volver", callback_data="dedupe_reset_menu",
+    )])
     return InlineKeyboardMarkup(filas)
 
 
@@ -1138,15 +1315,25 @@ def cuentas_disponibles_para_programar():
     ]
 
 
-def menu_programaciones() -> InlineKeyboardMarkup:
+def menu_modalidades_programacion() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Programaciones normales", callback_data="schedules_normal")],
+        [InlineKeyboardButton("🔄 Programaciones variables", callback_data="schedules_variable")],
+        [InlineKeyboardButton("📋 Ver programaciones", callback_data="sched_list")],
+        [InlineKeyboardButton("‹ Menú principal", callback_data="menu")],
+    ])
+
+
+def menu_programaciones(modalidad: str = "normal") -> InlineKeyboardMarkup:
     filas = []
     botones = []
 
     for cuenta in cuentas_disponibles_para_programar():
         botones.append(
-            InlineKeyboardButton(
+            boton_cuenta(
+                cuenta,
                 f"⏰ {cuenta['nombre']}",
-                callback_data=f"sched:{cuenta['username']}",
+                callback_data=f"{'schedv' if modalidad == 'variable' else 'sched'}:{cuenta['username']}",
             )
         )
 
@@ -1173,8 +1360,8 @@ def menu_programaciones() -> InlineKeyboardMarkup:
     filas.append(
         [
             InlineKeyboardButton(
-                "‹ Menú principal",
-                callback_data="menu",
+                "‹ Elegir modalidad",
+                callback_data="schedules",
             )
         ]
     )
@@ -1242,7 +1429,8 @@ def menu_lista_programaciones(
         )
 
         botones.append(
-            InlineKeyboardButton(
+            boton_cuenta(
+                buscar_cuenta(username) or {},
                 f"{estado} {nombre}",
                 callback_data=(
                     f"sched_detail:{username}"
@@ -1297,8 +1485,20 @@ def texto_detalle_programacion(
         "",
         f"Cuenta: <b>{esc(nombre)}</b>",
         f"Instagram: <b>@{esc(username)}</b>",
+        f"Modalidad: <b>{'Variable' if db.modalidad_sesiones_de(row) == 'variable' else 'Normal'}</b>",
         "",
     ]
+
+    if db.modalidad_sesiones_de(row) == "variable":
+        ids = db.sesiones_rotacion_de(row)
+        sesiones = listar_sesiones()
+        nombres = nombres_sesiones(sesiones)
+        etiquetas = [f"@{nombres[sid]} ({sid})" if nombres.get(sid) else sid for sid in ids]
+        orden = db.preparar_rotacion(int(row["chat_id"]), username)
+        siguiente = orden[0] if orden else None
+        proxima = f"@{nombres[siguiente]} ({siguiente})" if nombres.get(siguiente) else siguiente
+        lineas.extend(["Sesiones de rotación: " + esc(" · ".join(etiquetas)),
+                       "Próximo turno: " + esc(proxima or "sin sesiones"), ""])
 
     if (
         db.tipo_programacion(row)
@@ -1446,6 +1646,7 @@ def menu_detalle_programacion(
 
 def menu_tipo_programacion(
     username: str,
+    modalidad: str = "normal",
 ) -> InlineKeyboardMarkup:
     """
     Permite elegir entre el sistema clásico de horarios fijos
@@ -1457,7 +1658,7 @@ def menu_tipo_programacion(
                 InlineKeyboardButton(
                     "📅 Revisiones por día",
                     callback_data=(
-                        f"sched_mode_daily:{username}"
+                        f"{'schedv' if modalidad == 'variable' else 'sched'}_mode_daily:{username}"
                     ),
                 )
             ],
@@ -1465,14 +1666,14 @@ def menu_tipo_programacion(
                 InlineKeyboardButton(
                     "⏱ Intervalo de tiempo",
                     callback_data=(
-                        f"sched_mode_interval:{username}"
+                        f"{'schedv' if modalidad == 'variable' else 'sched'}_mode_interval:{username}"
                     ),
                 )
             ],
             [
                 InlineKeyboardButton(
                     "‹ Volver",
-                    callback_data="schedules",
+                    callback_data=f"schedules_{modalidad}",
                 )
             ],
         ]
@@ -1481,6 +1682,7 @@ def menu_tipo_programacion(
 
 def menu_intervalos(
     username: str,
+    modalidad: str = "normal",
 ) -> InlineKeyboardMarkup:
     """
     Intervalos disponibles: de 1 a 12 horas.
@@ -1498,7 +1700,7 @@ def menu_intervalos(
             InlineKeyboardButton(
                 etiqueta,
                 callback_data=(
-                    f"sched_interval:{username}:{horas}"
+                    f"{'schedv' if modalidad == 'variable' else 'sched'}_interval:{username}:{horas}"
                 ),
             )
         )
@@ -1520,7 +1722,7 @@ def menu_intervalos(
         [
             InlineKeyboardButton(
                 "‹ Volver",
-                callback_data=f"sched:{username}",
+                callback_data=f"{'schedv' if modalidad == 'variable' else 'sched'}:{username}",
             )
         ]
     )
@@ -1530,7 +1732,7 @@ def menu_intervalos(
     )
 
 
-def menu_cantidad(username: str) -> InlineKeyboardMarkup:
+def menu_cantidad(username: str, modalidad: str = "normal") -> InlineKeyboardMarkup:
     filas = []
 
     for n in range(1, 7):
@@ -1538,7 +1740,7 @@ def menu_cantidad(username: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     f"{n} revisión{'es' if n != 1 else ''} por día",
-                    callback_data=f"sched_count:{username}:{n}",
+                    callback_data=f"{'schedv' if modalidad == 'variable' else 'sched'}_count:{username}:{n}",
                 )
             ]
         )
@@ -1547,12 +1749,111 @@ def menu_cantidad(username: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 "‹ Volver",
-                callback_data=f"sched:{username}",
+                callback_data=f"{'schedv' if modalidad == 'variable' else 'sched'}:{username}",
             )
         ]
     )
 
     return InlineKeyboardMarkup(filas)
+
+
+def menu_destacadas() -> InlineKeyboardMarkup:
+    """Cuentas fijas para archivar sus carruseles de historias destacadas."""
+    filas = []
+    botones = []
+
+    for cuenta in cargar_cuentas():
+        botones.append(
+            boton_cuenta(
+                cuenta,
+                f"✨ {cuenta['nombre']}",
+                callback_data=f"highlights:{cuenta['username']}",
+            )
+        )
+
+    for posicion in range(0, len(botones), 2):
+        filas.append(botones[posicion:posicion + 2])
+
+    filas.append([
+        InlineKeyboardButton("‹ Menú principal", callback_data="menu")
+    ])
+    return InlineKeyboardMarkup(filas)
+
+
+def conservar_flujo_programacion(context, username: str, modalidad: str) -> bool:
+    """Cada botón lleva su modalidad; un flujo variable exige su comprobación."""
+    sesiones = []
+    elegidas = []
+    if (context.user_data.get(SCHED_USERNAME) not in (None, username)
+            or context.user_data.get(SCHED_MODALIDAD) not in (None, modalidad)):
+        return False
+    if modalidad == "variable":
+        if (context.user_data.get(SCHED_USERNAME) != username
+                or context.user_data.get(SCHED_MODALIDAD) != "variable"
+                or not context.user_data.get(SCHED_SESIONES)
+                or not context.user_data.get(SCHED_SESIONES_ELEGIDAS)):
+            return False
+        sesiones = list(context.user_data[SCHED_SESIONES])
+        elegidas = list(context.user_data[SCHED_SESIONES_ELEGIDAS])
+    context.user_data.clear()
+    context.user_data.update({SCHED_USERNAME: username, SCHED_MODALIDAD: modalidad,
+                              SCHED_SESIONES: sesiones,
+                              SCHED_SESIONES_ELEGIDAS: elegidas})
+    return True
+
+
+def menu_seleccionar_sesiones_variable(username: str, context, message_id=None) -> InlineKeyboardMarkup:
+    """Lista las sesiones que confirmaron acceso y permite elegir el subconjunto."""
+    detectadas = list(context.user_data.get(SCHED_SESIONES_DETECTADAS) or
+                      context.user_data.get(SCHED_SESIONES) or [])
+    elegidas = set(context.user_data.get(SCHED_SESIONES_ELEGIDAS) or [])
+    nombres = nombres_sesiones(listar_sesiones())
+    tokens = {}
+    filas = []
+    for sesion_id in detectadas:
+        token = uuid.uuid4().hex[:12]
+        tokens[token] = sesion_id
+        nombre = nombres.get(sesion_id)
+        etiqueta = f"@{nombre}" if nombre else "Usuario sin identificar"
+        marcado = sesion_id in elegidas
+        button_kwargs = {"callback_data": f"schedv_session_toggle:{token}"}
+        if marcado:
+            button_kwargs["style"] = "primary"
+        filas.append([InlineKeyboardButton(
+            f"{'☑️' if marcado else '⬜'} {etiqueta} · {sesion_id}", **button_kwargs)])
+    filas.append([InlineKeyboardButton(
+        "✅ Confirmar sesiones elegidas", callback_data="schedv_session_confirm")])
+    filas.append([InlineKeyboardButton(
+        "‹ Volver a cuentas", callback_data="schedules_variable")])
+    context.user_data[SCHED_SELECCION_TOKENS] = tokens
+    context.user_data[SCHED_SELECCION_MESSAGE_ID] = message_id
+    return InlineKeyboardMarkup(filas)
+
+
+def sesiones_rotacion_confirmadas(perfil: dict) -> list[str]:
+    """Dos JSON del mismo usuario representan una sola cuenta en la rotación."""
+    sesiones = listar_sesiones()
+    por_id = {sesion.id: sesion for sesion in sesiones}
+    nombres = nombres_sesiones(sesiones)
+    identidades, resultado = set(), []
+    for fila in perfil.get("sesiones_confirmadas", []):
+        sid = fila["id"]
+        if sid not in por_id:
+            continue
+        nombre = nombres.get(sid) or fila.get("username")
+        identidad = ("username", nombre.casefold()) if nombre else ("sesion", sid)
+        if identidad not in identidades:
+            identidades.add(identidad)
+            resultado.append(sid)
+    return resultado
+
+
+def texto_modalidad_guardada(row) -> str:
+    if db.modalidad_sesiones_de(row) == "variable":
+        cantidad = len(db.sesiones_rotacion_de(row))
+        return (f"Modalidad: VARIABLE · {cantidad} sesión(es) con acceso confirmado.\n"
+                "Cada ejecución toma el siguiente turno de la lista guardada.")
+    return "Modalidad: NORMAL. Crear la programación no hizo ninguna consulta a Instagram."
 
 
 def parse_hhmm(texto: str):
@@ -1856,6 +2157,35 @@ async def enviar_archivo(
     )
 
 
+def consultar_historias_variables(chat_id: int, username: str, user_id: int | None):
+    """Resolver y descargar en la misma sesión; conservar la preferida normal."""
+    orden = db.preparar_rotacion(chat_id, username)
+    if not orden:
+        raise ConfiguracionSesionesError("La programación variable no tiene sesiones de rotación.")
+    sesion_exitosa = None
+
+    def consultar():
+        nonlocal user_id, sesion_exitosa
+        sesion = sesion_actual()
+        if user_id is None:
+            user_id = resolver_user_id(username)
+            actualizar_user_id(username, user_id)
+        try:
+            historias = descargar_historias(username, user_id)
+        except SinHistoriasDisponibles:
+            sesion_exitosa = sesion.id
+            raise
+        sesion_exitosa = sesion.id
+        return historias
+
+    try:
+        return ejecutar_con_sesiones(username, consultar, orden_sesion_ids=orden,
+                                     conservar_preferida=True)
+    finally:
+        # Incluso un turno sin Stories o con todos los intentos fallidos avanza.
+        db.registrar_sesion_rotacion(chat_id, username, sesion_exitosa or orden[0])
+
+
 async def revisar_usuario(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -1890,21 +2220,14 @@ async def revisar_usuario(
     )
 
     async with IG_LOCK:
-        if user_id is None:
-            user_id = await asyncio.to_thread(
-                resolver_user_id,
-                username,
-            )
-            actualizar_user_id(
-                username,
-                user_id,
-            )
-
-        historias = await asyncio.to_thread(
-            descargar_historias,
-            username,
-            user_id,
-        )
+        programacion = db.obtener_programacion(chat_id, username) if not manual else None
+        if programacion is not None and db.modalidad_sesiones_de(programacion) == "variable":
+            historias = await asyncio.to_thread(consultar_historias_variables, chat_id, username, user_id)
+        else:
+            if user_id is None:
+                user_id = await asyncio.to_thread(resolver_user_id, username)
+                actualizar_user_id(username, user_id)
+            historias = await asyncio.to_thread(descargar_historias, username, user_id)
 
     # La comprobación y el registro del Story ID deben pertenecer a una única
     # sección crítica. Así una revisión manual y una automática no pueden ver
@@ -2225,6 +2548,181 @@ async def callback(
         )
         return
 
+    if data == "highlights_menu":
+        context.user_data.clear()
+
+        cuentas = cargar_cuentas()
+        texto = (
+            "✨ <b>Historias destacadas</b>\n\n"
+            "Elegí una cuenta para descargar sus carruseles al servidor:"
+            if cuentas
+            else
+            "ℹ️ No hay cuentas configuradas."
+        )
+
+        await query.edit_message_text(
+            texto,
+            parse_mode="HTML",
+            reply_markup=menu_destacadas(),
+        )
+        return
+
+    if data.startswith("highlights:"):
+        username = limpiar_username(data.split(":", 1)[1])
+        cuenta = buscar_cuenta(username)
+
+        if cuenta is None:
+            await query.edit_message_text(
+                f"ℹ️ @{username} ya no está en las cuentas fijas.",
+                reply_markup=menu_destacadas(),
+            )
+            return
+
+        await query.edit_message_text(
+            f"⏳ Buscando historias destacadas de @{username}...\n\n"
+            "Se usará primero la sesión preferida y, si hace falta, las sesiones autorizadas.\n"
+            "El progreso se actualizará automáticamente cada 10 segundos."
+        )
+
+        progreso_lock = threading.Lock()
+        progreso_estado = {
+            "etapa": "iniciando",
+            "grupos_detectados": 0,
+            "grupos_procesados": 0,
+            "historias_detectadas": 0,
+            "historias_procesadas": 0,
+            "archivos_nuevos": 0,
+            "archivos_guardados": 0,
+            "fallidas": 0,
+        }
+        inicio_progreso = time.monotonic()
+
+        def recibir_progreso_destacadas(datos: dict) -> None:
+            with progreso_lock:
+                for clave, valor in datos.items():
+                    if clave in {
+                        "grupos_detectados", "grupos_procesados",
+                        "historias_detectadas", "historias_procesadas",
+                        "archivos_nuevos", "archivos_guardados", "fallidas",
+                    }:
+                        progreso_estado[clave] = max(
+                            int(progreso_estado.get(clave) or 0),
+                            int(valor or 0),
+                        )
+                    else:
+                        progreso_estado[clave] = valor
+
+        def texto_progreso_destacadas() -> str:
+            with progreso_lock:
+                estado = dict(progreso_estado)
+
+            transcurrido = max(0, int(time.monotonic() - inicio_progreso))
+            minutos, segundos = divmod(transcurrido, 60)
+            tiempo_texto = (
+                f"{minutos} min {segundos:02d} s"
+                if minutos
+                else f"{segundos} s"
+            )
+            etiquetas = {
+                "iniciando": "Preparando navegador y sesión",
+                "procesando": "Descargando y guardando Highlights",
+                "terminado": "Finalizando",
+            }
+            etapa = etiquetas.get(
+                str(estado.get("etapa") or ""),
+                "Procesando",
+            )
+            grupos_detectados = int(estado.get("grupos_detectados") or 0)
+            grupos_procesados = int(estado.get("grupos_procesados") or 0)
+            historias_detectadas = int(estado.get("historias_detectadas") or 0)
+            historias_procesadas = int(estado.get("historias_procesadas") or 0)
+            archivos_nuevos = int(estado.get("archivos_nuevos") or 0)
+            archivos_guardados = int(estado.get("archivos_guardados") or 0)
+            fallidas = int(estado.get("fallidas") or 0)
+
+            return (
+                f"⏳ Descargando Highlights de @{username}...\n\n"
+                f"🟢 Estado: {etapa}\n"
+                f"🕒 Tiempo: {tiempo_texto}\n"
+                f"✨ Carruseles detectados: {grupos_detectados}\n"
+                f"⚙️ Carruseles procesados: {grupos_procesados}/{grupos_detectados}\n"
+                f"🔎 Historias detectadas: {historias_detectadas}\n"
+                f"📥 Historias procesadas: {historias_procesadas}\n"
+                f"🆕 Archivos nuevos: {archivos_nuevos}\n"
+                f"📁 Archivos guardados: {archivos_guardados}\n"
+                f"⚠️ Fallidas/pendientes: {fallidas}\n\n"
+                "Actualización automática cada 10 segundos."
+            )
+
+        async def refrescar_progreso_destacadas() -> None:
+            while True:
+                await asyncio.sleep(10)
+                try:
+                    await query.edit_message_text(
+                        texto_progreso_destacadas()
+                    )
+                except TelegramError as error:
+                    if "not modified" not in str(error).lower():
+                        logger.warning(
+                            "No se pudo refrescar el progreso de Highlights de @%s: %s",
+                            username,
+                            error,
+                        )
+
+        tarea_progreso = asyncio.create_task(
+            refrescar_progreso_destacadas()
+        )
+
+        try:
+            try:
+                async with IG_LOCK:
+                    resultado = await asyncio.to_thread(
+                        descargar_destacadas,
+                        username,
+                        cuenta.get("user_id"),
+                        AUTHORIZED_CHAT_ID,
+                        progress_callback=recibir_progreso_destacadas,
+                    )
+            finally:
+                tarea_progreso.cancel()
+                try:
+                    await tarea_progreso
+                except asyncio.CancelledError:
+                    pass
+
+            await query.edit_message_text(
+                f"✅ <b>@{esc(username)}</b>\n\n"
+                f"Carruseles encontrados: <b>{len(resultado.grupos)}</b>\n"
+                f"Archivos nuevos: <b>{resultado.archivos_nuevos}</b>\n"
+                f"Ya guardados: <b>{resultado.archivos_ya_guardados}</b>\n\n"
+                f"📁 <code>{esc(str(resultado.carpeta))}</code>",
+                parse_mode="HTML",
+                reply_markup=menu_destacadas(),
+            )
+        except SinHistoriasDestacadas:
+            await query.edit_message_text(
+                f"ℹ️ <b>@{esc(username)}</b>\n\n"
+                "No hemos detectado historias destacadas dentro de este perfil.",
+                parse_mode="HTML",
+                reply_markup=menu_destacadas(),
+            )
+        except Exception as error:
+            logger.exception("Error descargando historias destacadas de @%s", username)
+            icono, tipo, recomendacion = diagnosticar_error(error)
+            detalle = str(error).strip() or repr(error)
+            if BOT_TOKEN:
+                detalle = detalle.replace(BOT_TOKEN, "[TOKEN OCULTO]")
+            await query.edit_message_text(
+                f"{icono} <b>ERROR EN HISTORIAS DESTACADAS</b>\n\n"
+                f"Cuenta: <b>@{esc(username)}</b>\n"
+                f"Tipo: <b>{esc(tipo)}</b>\n\n"
+                f"<code>{esc(detalle[:900])}</code>\n\n"
+                f"💡 {esc(recomendacion)}",
+                parse_mode="HTML",
+                reply_markup=menu_destacadas(),
+            )
+        return
+
     if data.startswith("publications:"):
         username = limpiar_username(
             data.split(":", 1)[1]
@@ -2352,8 +2850,7 @@ async def callback(
 
         try:
             try:
-                # Usa el mismo instagram_state.json que Stories. El lock evita
-                # que dos operaciones de Instagram escriban el state a la vez.
+                # Comparte con Stories la selección y asociación de sesiones.
                 async with IG_LOCK:
                     resultado = await asyncio.to_thread(
                         descargar_publicaciones,
@@ -2469,8 +2966,7 @@ async def callback(
         cuentas = cargar_cuentas()
         texto = (
             "♻️ <b>Reiniciar antirepetición</b>\n\n"
-            "Elegí una cuenta. Se eliminarán solamente los IDs "
-            "registrados de Stories y publicaciones de ese perfil."
+            "Elegí una cuenta y después qué IDs querés resetear."
             if cuentas
             else
             "ℹ️ No hay cuentas configuradas."
@@ -2496,28 +2992,64 @@ async def callback(
 
         await query.edit_message_text(
             (
-                f"⚠️ <b>Reiniciar antirepetición de @{esc(username)}</b>\n\n"
-                "Esto olvidará únicamente los IDs registrados de este perfil:\n"
-                "• Stories procesadas\n"
-                "• Publicaciones descargadas\n\n"
-                "No borra archivos, cuenta, programación ni sesión.\n\n"
-                "La próxima descarga de publicaciones volverá a recorrer "
-                "el historial completo disponible."
+                f"♻️ <b>Antirepetición de @{esc(username)}</b>\n\n"
+                "Elegí qué registros querés resetear.\n"
+                "Los archivos descargados se conservarán."
             ),
+            parse_mode="HTML",
+            reply_markup=menu_tipos_antirepeticion(username),
+        )
+        return
+
+    if data.startswith("dedupe_reset_type:"):
+        partes = data.split(":", 2)
+        username = limpiar_username(partes[1])
+        codigo = partes[2] if len(partes) == 3 else ""
+        if codigo not in ANTIREPETICION_TIPOS:
+            await query.edit_message_text(
+                "ℹ️ Opción de antirepetición inválida. Elegí nuevamente.",
+                reply_markup=menu_reiniciar_antirepeticion(),
+            )
+            return
+        if buscar_cuenta(username) is None:
+            await query.edit_message_text(
+                f"ℹ️ @{username} ya no está en las cuentas configuradas.",
+                reply_markup=menu_reiniciar_antirepeticion(),
+            )
+            return
+        tipo, etiqueta = ANTIREPETICION_TIPOS[codigo]
+        alcance = {
+            "todo": "Stories, publicaciones e historias destacadas",
+            "historias": "Stories",
+            "publicaciones": "publicaciones",
+            "destacadas": "historias destacadas",
+        }[tipo]
+        texto = (
+            f"⚠️ <b>{esc(etiqueta)} de @{esc(username)}</b>\n\n"
+            f"Se eliminarán únicamente los IDs registrados de {alcance}.\n"
+            "Los archivos descargados se conservarán."
+        )
+        if tipo in {"todo", "publicaciones"}:
+            texto += (
+                "\n\nLa próxima descarga de publicaciones volverá a recorrer "
+                "el historial completo disponible."
+            )
+        await query.edit_message_text(
+            texto,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton(
-                            "♻️ Sí, reiniciar este perfil",
-                            callback_data=f"dedupe_reset_confirm:{username}",
+                            f"♻️ Sí, {etiqueta.lower()}",
+                            callback_data=f"dedupe_reset_confirm:{username}:{codigo}",
                             style="danger",
                         )
                     ],
                     [
                         InlineKeyboardButton(
                             "❌ Cancelar",
-                            callback_data="dedupe_reset_menu",
+                            callback_data=f"dedupe_reset_select:{username}",
                         )
                     ],
                 ]
@@ -2526,9 +3058,17 @@ async def callback(
         return
 
     if data.startswith("dedupe_reset_confirm:"):
-        username = limpiar_username(
-            data.split(":", 1)[1]
-        )
+        partes = data.split(":", 2)
+        username = limpiar_username(partes[1])
+        # Los botones de la versión anterior conservan el reseteo completo.
+        codigo = partes[2] if len(partes) == 3 else "todo"
+        if codigo not in ANTIREPETICION_TIPOS:
+            await query.edit_message_text(
+                "ℹ️ Opción de antirepetición inválida. Elegí nuevamente.",
+                reply_markup=menu_reiniciar_antirepeticion(),
+            )
+            return
+        tipo, etiqueta = ANTIREPETICION_TIPOS[codigo]
         cuenta = buscar_cuenta(username)
         if cuenta is None:
             await query.edit_message_text(
@@ -2541,17 +3081,24 @@ async def callback(
             eliminados = db.limpiar_antirepeticion_perfil(
                 AUTHORIZED_CHAT_ID,
                 username,
+                tipo=tipo,
             )
 
+        lineas = []
+        for nombre, descripcion in (
+            ("historias", "Stories"),
+            ("destacadas", "historias destacadas"),
+            ("publicaciones", "publicaciones"),
+        ):
+            if tipo in {"todo", nombre}:
+                lineas.append(f"IDs de {descripcion} eliminados: {eliminados[nombre]}")
         await query.edit_message_text(
             (
-                f"✅ <b>@{esc(username)}</b> reiniciada.\n\n"
-                f"IDs de Stories eliminados: "
-                f"{eliminados['historias']}\n"
-                f"IDs de publicaciones eliminados: "
-                f"{eliminados['publicaciones']}\n\n"
+                f"✅ <b>@{esc(username)}</b>: {esc(etiqueta)} completado.\n\n"
+                + "\n".join(lineas)
+                + "\n\n"
                 "Los archivos existentes no fueron eliminados.\n"
-                "La próxima descarga podrá procesar nuevamente este perfil."
+                "La próxima revisión podrá procesar nuevamente el contenido elegido."
             ),
             parse_mode="HTML",
             reply_markup=menu_reiniciar_antirepeticion(),
@@ -2569,6 +3116,260 @@ async def callback(
         )
         return
 
+    if data == "highlight_accounts":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "⭐ Destacar cuentas\n\nTocá una cuenta para destacar o quitar la marca. Las destacadas aparecen en azul en las listas.",
+            reply_markup=menu_cuentas_destacadas(),
+        )
+        return
+
+    if data.startswith("highlight_toggle:"):
+        username = limpiar_username(data.split(":", 1)[1])
+        try:
+            destacada = alternar_cuenta_destacada(username)
+            texto = f"{'⭐ Destacada' if destacada else '☆ Marca quitada'}: @{username}\n\nTocá otra cuenta para cambiar su marca."
+        except ValueError as error:
+            texto = str(error)
+        await query.edit_message_text(texto, reply_markup=menu_cuentas_destacadas())
+        return
+
+    if data == "pref_accounts":
+        context.user_data.clear()
+        await query.edit_message_text("🔑 Cambiar sesión preferida\n\nElegí el perfil que querés consultar con otra sesión.",
+                                      reply_markup=menu_perfiles_sesion_preferida())
+        return
+
+    if data.startswith("pref_profile:"):
+        username = limpiar_username(data.split(":", 1)[1])
+        if buscar_cuenta(username) is None:
+            await query.edit_message_text("Ese perfil ya no está agregado.", reply_markup=menu_perfiles_sesion_preferida())
+            return
+        message_id = getattr(query.message, "message_id", None)
+        await query.edit_message_text(
+            f"🔑 Sesión preferida para @{username}\n\nElegí la cuenta de Instagram. Si todavía no tiene acceso registrado, se comprobará sólo esa cuenta antes de guardar.",
+            reply_markup=menu_elegir_sesion_preferida(username, context, message_id),
+        )
+        return
+
+    if data.startswith("pref_pick:"):
+        token = data.split(":", 1)[1]
+        seleccion = context.user_data.get("preferencia_seleccion") or {}
+        sesion_elegida = seleccion.get("elecciones", {}).get(token)
+        username = seleccion.get("username")
+        message_id = getattr(query.message, "message_id", None)
+        if not sesion_elegida or not username or seleccion.get("message_id") != message_id:
+            await query.edit_message_text("Esta selección quedó desactualizada. Volvé a elegir el perfil.",
+                                          reply_markup=menu_perfiles_sesion_preferida())
+            return
+        if buscar_cuenta(username) is None:
+            context.user_data.pop("preferencia_seleccion", None)
+            await query.edit_message_text("Ese perfil ya no está agregado.", reply_markup=menu_perfiles_sesion_preferida())
+            return
+        await query.edit_message_text(f"⏳ Aplicando la sesión elegida para @{username}...")
+        try:
+            async with IG_LOCK:
+                vinculo = await asyncio.to_thread(
+                    cambiar_sesion_preferida, username, sesion_elegida.id,
+                    lambda: comprobar_perfil_accesible(username), sesion_esperada=sesion_elegida,
+                )
+            sesiones = listar_sesiones()
+            nombre = nombres_sesiones(sesiones).get(vinculo["sesion_id"]) or vinculo.get("cuenta")
+            etiqueta = f"@{nombre}" if nombre else vinculo["sesion_id"]
+            texto = f"✅ @{username}\nSesión preferida: {etiqueta} ({vinculo['sesion_id']}).\nTu elección queda guardada como predeterminada."
+        except Exception as error:
+            _icono, tipo, _recomendacion = diagnosticar_error(error)
+            texto = f"❌ No se cambió la sesión preferida de @{username}.\n{tipo}: {str(error)[:400]}"
+        context.user_data.pop("preferencia_seleccion", None)
+        await query.edit_message_text(texto, reply_markup=menu_perfiles_sesion_preferida())
+        return
+
+    if data == "sessions_update":
+        context.user_data.clear()
+        try:
+            nuevas = await asyncio.to_thread(listar_sesiones_nuevas)
+            if not nuevas:
+                await query.edit_message_text(
+                    "ℹ️ No hay sesiones nuevas ni actualizaciones pendientes.\n\n"
+                    "Todas las sesiones habilitadas ya tienen asociaciones.",
+                    reply_markup=menu_gestion(),
+                )
+                return
+            token = uuid.uuid4().hex[:12]
+            context.user_data["actualizar_sesiones_seleccion"] = {
+                "token": token,
+                "message_id": getattr(query.message, "message_id", None),
+                "sesiones": nuevas,
+            }
+            filas = [
+                [InlineKeyboardButton(
+                    sesion.etiqueta,
+                    callback_data=f"session_add_access:{token}:{posicion}",
+                )]
+                for posicion, sesion in enumerate(nuevas)
+            ]
+            filas.append([InlineKeyboardButton("‹ Volver", callback_data="manage")])
+            await query.edit_message_text(
+                "🔄 Actualizar sesiones\n\n"
+                "Elegí una sesión nueva o una actualización pendiente. "
+                "Se comprobará su acceso a los perfiles agregados y se añadirá como respaldo.\n\n"
+                "Las sesiones preferidas se conservan.",
+                reply_markup=InlineKeyboardMarkup(filas),
+            )
+        except Exception as error:
+            await query.edit_message_text(
+                f"❌ No se pudieron listar las sesiones: {str(error)[:500]}",
+                reply_markup=menu_gestion(),
+            )
+        return
+
+    if data.startswith("session_add_access:"):
+        partes = data.split(":")
+        seleccion = context.user_data.get("actualizar_sesiones_seleccion")
+        valida = (
+            len(partes) == 3
+            and isinstance(seleccion, dict)
+            and partes[1] == seleccion.get("token")
+            and partes[2].isascii()
+            and partes[2].isdigit()
+            and seleccion.get("message_id") == getattr(query.message, "message_id", None)
+            and int(partes[2]) < len(seleccion.get("sesiones", []))
+        )
+        if not valida:
+            await query.edit_message_text(
+                "ℹ️ Esta selección venció. Abrí Actualizar sesiones nuevamente.",
+                reply_markup=menu_gestion(),
+            )
+            return
+        elegida = seleccion["sesiones"][int(partes[2])]
+        context.user_data.pop("actualizar_sesiones_seleccion", None)
+        cuentas_para_actualizar = cargar_cuentas()
+        objetivos = [cuenta["username"] for cuenta in cuentas_para_actualizar]
+        ids_perfiles = {cuenta["username"]: cuenta.get("user_id") for cuenta in cuentas_para_actualizar}
+        if not objetivos:
+            await query.edit_message_text(
+                "ℹ️ No hay perfiles agregados para comprobar.", reply_markup=menu_gestion()
+            )
+            return
+        progreso_lock = threading.Lock()
+        progreso_estado = {
+            "total": len(objetivos), "procesados": 0, "añadidos": 0,
+            "sin_acceso": 0, "fallidas": 0, "pendientes": len(objetivos),
+            "username_actual": None, "etapa": "esperando",
+        }
+        inicio = time.monotonic()
+
+        def recibir_progreso_asociaciones(datos: dict) -> None:
+            with progreso_lock:
+                progreso_estado.update(datos)
+
+        def actualizar_accesos_desde_paginas() -> dict:
+            # El navegador se crea al verificar el primer perfil bajo la
+            # sesión elegida y se reutiliza durante todo el lote.
+            with comprobar_perfiles_desde_pagina() as verificar:
+                return actualizar_accesos_sesion(
+                    elegida.id,
+                    objetivos,
+                    lambda username: verificar(username, user_id=ids_perfiles.get(username)),
+                    sesion_esperada=elegida,
+                    progreso=recibir_progreso_asociaciones,
+                )
+
+        def texto_progreso_asociaciones() -> str:
+            with progreso_lock:
+                estado = dict(progreso_estado)
+            segundos = max(0, int(time.monotonic() - inicio))
+            minutos, resto = divmod(segundos, 60)
+            tiempo = f"{minutos} min {resto:02d} s" if minutos else f"{resto} s"
+            actual = estado.get("username_actual")
+            consulta = f"Comprobando @{actual}" if actual else "Preparando comprobación"
+            return (
+                f"⏳ Actualizando accesos de {elegida.etiqueta}...\n\n"
+                f"🟢 Estado: {consulta}\n"
+                f"🕒 Tiempo: {tiempo}\n"
+                f"⚙️ Perfiles comprobados: {estado['procesados']}/{estado['total']}\n"
+                f"✅ Con acceso: {estado['añadidos']}\n"
+                f"🔒 Sin acceso: {estado['sin_acceso']}\n"
+                f"⚠️ No se pudieron comprobar: {estado['fallidas']}\n"
+                f"📋 Pendientes: {estado['pendientes']}\n\n"
+                "Actualización automática cada 10 segundos."
+            )
+
+        await query.edit_message_text(texto_progreso_asociaciones())
+
+        async def refrescar_asociaciones() -> None:
+            while True:
+                await asyncio.sleep(10)
+                try:
+                    await query.edit_message_text(texto_progreso_asociaciones())
+                except TelegramError as error:
+                    if "not modified" not in str(error).lower():
+                        logger.warning("No se pudo mostrar el progreso de accesos: %s", error)
+
+        tarea = asyncio.create_task(refrescar_asociaciones())
+        try:
+            try:
+                async with IG_LOCK:
+                    tarea_accesos = asyncio.create_task(asyncio.to_thread(
+                        actualizar_accesos_desde_paginas,
+                    ))
+                    try:
+                        resultado = await asyncio.shield(tarea_accesos)
+                    except asyncio.CancelledError:
+                        # Cancelar el callback no detiene el hilo. Conservar el
+                        # bloqueo hasta que termine evita consultas solapadas.
+                        while not tarea_accesos.done():
+                            try:
+                                await asyncio.shield(tarea_accesos)
+                            except asyncio.CancelledError:
+                                continue
+                            except Exception:
+                                break
+                        if not tarea_accesos.cancelled() and tarea_accesos.exception():
+                            logger.warning("La actualización cancelada terminó con un error: %s",
+                                           tarea_accesos.exception())
+                        raise
+            finally:
+                tarea.cancel()
+                try:
+                    await tarea
+                except asyncio.CancelledError:
+                    pass
+            interrumpida = resultado["interrumpida"]
+            parcial = not interrumpida and (
+                resultado.get("etapa") == "parcial" or resultado["pendientes"] > 0
+            )
+            estado_final = (
+                "⚠️ Actualización interrumpida" if interrumpida else
+                "⚠️ Actualización parcial" if parcial else
+                "✅ Actualización terminada"
+            )
+            texto = (
+                f"{estado_final}\n\n"
+                f"Sesión: {elegida.etiqueta}\n"
+                f"Perfiles comprobados: {resultado['procesados']}/{resultado['total']}\n"
+                f"Con acceso / respaldo añadido: {resultado['añadidos']}\n"
+                f"Sin acceso: {resultado['sin_acceso']}\n"
+                f"No se pudieron comprobar: {resultado['fallidas']}\n"
+                f"Pendientes: {resultado['pendientes']}\n\n"
+                "Las sesiones preferidas se conservaron."
+            )
+            if interrumpida:
+                texto += (
+                    f"\n\nMotivo: {str(resultado.get('motivo') or '')[:500]}\n"
+                    "Los accesos confirmados quedaron guardados. "
+                    "Podés continuar desde Actualizar sesiones después de resolver el problema."
+                )
+            elif parcial:
+                texto += (
+                    "\n\nLos accesos confirmados quedaron guardados. "
+                    "Podés continuar desde Actualizar sesiones para comprobar los perfiles pendientes."
+                )
+        except Exception as error:
+            texto = f"❌ No se pudo completar la actualización de {elegida.etiqueta}.\n{str(error)[:700]}"
+        await query.edit_message_text(texto, reply_markup=menu_gestion())
+        return
+
     if data == "list_accounts":
         cuentas = cargar_cuentas()
 
@@ -2580,7 +3381,7 @@ async def callback(
             for cuenta in cuentas:
                 uid = cuenta.get("user_id") or "sin resolver"
                 lineas.append(
-                    f"• {esc(cuenta['nombre'])} — "
+                    f"{'⭐' if cuenta.get('destacada') else '•'} {esc(cuenta['nombre'])} — "
                     f"@{esc(cuenta['username'])} — ID {uid}"
                 )
 
@@ -2598,7 +3399,8 @@ async def callback(
 
         filas = [
             [
-                InlineKeyboardButton(
+                boton_cuenta(
+                    c,
                     f"🗑 {c['nombre']}",
                     callback_data=f"remove_do:{c['username']}",
                 )
@@ -2626,14 +3428,9 @@ async def callback(
             data.split(":", 1)[1]
         )
 
-        cuentas = [
-            c
-            for c in cargar_cuentas()
-            if c["username"].casefold()
-            != username.casefold()
-        ]
-
-        guardar_cuentas(cuentas)
+        with CUENTAS_LOCK:
+            cuentas = [c for c in cargar_cuentas() if c["username"].casefold() != username.casefold()]
+            guardar_cuentas(cuentas)
 
         db.eliminar_programacion(
             AUTHORIZED_CHAT_ID,
@@ -2712,14 +3509,23 @@ async def callback(
 
     if data == "schedules":
         context.user_data.clear()
+        await query.edit_message_text(
+            "⚙️ Programar revisiones\n\nElegí la modalidad de sesiones:",
+            reply_markup=menu_modalidades_programacion(),
+        )
+        return
 
+    if data in ("schedules_normal", "schedules_variable"):
+        modalidad = "variable" if data == "schedules_variable" else "normal"
+        context.user_data.clear()
+        context.user_data[SCHED_MODALIDAD] = modalidad
         disponibles = (
             cuentas_disponibles_para_programar()
         )
 
         if disponibles:
             texto = (
-                "⚙️ <b>Programar revisión</b>\n\n"
+                f"⚙️ <b>Programaciones {'variables' if modalidad == 'variable' else 'normales'}</b>\n\n"
                 "Elegí una cuenta:"
             )
         else:
@@ -2734,14 +3540,20 @@ async def callback(
         await query.edit_message_text(
             texto,
             parse_mode="HTML",
-            reply_markup=menu_programaciones(),
+            reply_markup=menu_programaciones(modalidad),
         )
         return
 
-    if data.startswith("sched:"):
+    if data.startswith(("sched:", "schedv:")):
+        modalidad = "variable" if data.startswith("schedv:") else "normal"
         username = limpiar_username(
             data.split(":", 1)[1]
         )
+
+        if buscar_cuenta(username) is None:
+            await query.edit_message_text("Ese perfil ya no está agregado.",
+                                          reply_markup=menu_programaciones(modalidad))
+            return
 
         existente = db.obtener_programacion(
             AUTHORIZED_CHAT_ID,
@@ -2761,46 +3573,150 @@ async def callback(
                     "No se creó una programación duplicada."
                 ),
                 parse_mode="HTML",
-                reply_markup=menu_programaciones(),
+                reply_markup=menu_programaciones(modalidad),
             )
             return
 
-        context.user_data.clear()
-        context.user_data[SCHED_USERNAME] = username
+        cache = (context.user_data.get(SCHED_USERNAME) == username
+                 and context.user_data.get(SCHED_MODALIDAD) == modalidad
+                 and context.user_data.get(SCHED_SESIONES))
+        if modalidad == "variable" and not cache:
+            context.user_data.clear()
+            await query.edit_message_text(f"⏳ Comprobando qué sesiones tienen acceso a @{username}...")
+            try:
+                async with IG_LOCK:
+                    perfil = await asyncio.to_thread(verificar_accesos_perfil, username,
+                        lambda: comprobar_perfil_accesible(username))
+                sesiones = sesiones_rotacion_confirmadas(perfil)
+                if not sesiones:
+                    raise ConfiguracionSesionesError("Ninguna sesión confirmó acceso al perfil.")
+            except Exception as error:
+                _icono, tipo, _recomendacion = diagnosticar_error(error)
+                await query.edit_message_text(f"❌ No se pudo preparar la programación variable.\n{tipo}: {str(error)[:1000]}",
+                                              reply_markup=menu_programaciones("variable"))
+                return
+            context.user_data.update({SCHED_USERNAME: username, SCHED_MODALIDAD: modalidad,
+                                      SCHED_SESIONES_DETECTADAS: sesiones,
+                                      SCHED_SESIONES_ELEGIDAS: None,
+                                      SCHED_SESIONES: sesiones})
+            await query.edit_message_text(
+                f"🔄 @{username}\n\nSe detectaron {len(sesiones)} sesión(es) con acceso. "
+                "Elegí una o varias para las ejecuciones automáticas:",
+                reply_markup=menu_seleccionar_sesiones_variable(
+                    username, context, getattr(query.message, "message_id", None)),
+            )
+            return
+        if modalidad == "variable" and not context.user_data.get(SCHED_SESIONES_ELEGIDAS):
+            await query.edit_message_text(
+                f"🔄 @{username}\n\nElegí una o varias sesiones para las ejecuciones automáticas:",
+                reply_markup=menu_seleccionar_sesiones_variable(
+                    username, context, getattr(query.message, "message_id", None)),
+            )
+            return
+        if modalidad == "normal":
+            context.user_data.clear()
+            context.user_data.update({SCHED_USERNAME: username, SCHED_MODALIDAD: "normal"})
+        conservar_flujo_programacion(context, username, modalidad)
+        cantidad = len(context.user_data[SCHED_SESIONES])
+        resumen = (f"🔄 Variable: {cantidad} sesión(es) con acceso confirmado.\n"
+                   + ("Sólo hay una: las revisiones usarán esa cuenta.\n" if cantidad == 1 else "")) if modalidad == "variable" else ""
 
         await query.edit_message_text(
             f"⏰ @{username}\n\n"
+            f"{resumen}"
             "¿Cómo querés programar las revisiones?",
             reply_markup=menu_tipo_programacion(
-                username
+                username, modalidad
             ),
         )
         return
 
-    if data.startswith("sched_mode_daily:"):
+    if data.startswith("schedv_session_toggle:"):
+        token = data.split(":", 1)[1]
+        if getattr(query.message, "message_id", None) != context.user_data.get(SCHED_SELECCION_MESSAGE_ID):
+            await query.edit_message_text(
+                "Esta selección quedó desactualizada. Volvé a elegir las sesiones.",
+                reply_markup=menu_programaciones("variable"),
+            )
+            return
+        username = context.user_data.get(SCHED_USERNAME)
+        sesion_id = (context.user_data.get(SCHED_SELECCION_TOKENS) or {}).get(token)
+        detectadas = set(context.user_data.get(SCHED_SESIONES_DETECTADAS) or [])
+        if (context.user_data.get(SCHED_MODALIDAD) != "variable" or not username
+                or sesion_id not in detectadas):
+            await query.edit_message_text(
+                "Esta selección quedó desactualizada. Volvé a verificar el perfil.",
+                reply_markup=menu_programaciones("variable"),
+            )
+            return
+        elegidas = list(context.user_data.get(SCHED_SESIONES_ELEGIDAS) or [])
+        if sesion_id in elegidas:
+            elegidas.remove(sesion_id)
+        else:
+            elegidas.append(sesion_id)
+        context.user_data[SCHED_SESIONES_ELEGIDAS] = elegidas
+        await query.edit_message_text(
+            f"🔄 @{username}\n\nElegidas: {len(elegidas)} de {len(detectadas)}. "
+            "Podés seleccionar una o varias:",
+            reply_markup=menu_seleccionar_sesiones_variable(
+                username, context, getattr(query.message, "message_id", None)),
+        )
+        return
+
+    if data == "schedv_session_confirm":
+        username = context.user_data.get(SCHED_USERNAME)
+        elegidas = list(context.user_data.get(SCHED_SESIONES_ELEGIDAS) or [])
+        detectadas = set(context.user_data.get(SCHED_SESIONES_DETECTADAS) or [])
+        if (getattr(query.message, "message_id", None) != context.user_data.get(SCHED_SELECCION_MESSAGE_ID)
+                or context.user_data.get(SCHED_MODALIDAD) != "variable"
+                or not username or not elegidas or any(sesion not in detectadas for sesion in elegidas)):
+            await query.edit_message_text(
+                "Elegí al menos una sesión válida para continuar.",
+                reply_markup=menu_seleccionar_sesiones_variable(
+                    username or "", context, getattr(query.message, "message_id", None)),
+            )
+            return
+        context.user_data[SCHED_SESIONES] = elegidas
+        context.user_data.pop(SCHED_SESIONES_DETECTADAS, None)
+        context.user_data.pop(SCHED_SELECCION_TOKENS, None)
+        context.user_data.pop(SCHED_SELECCION_MESSAGE_ID, None)
+        await query.edit_message_text(
+            f"✅ @{username}\n\nSe usarán {len(elegidas)} sesión(es) elegida(s).\n\n"
+            "¿Cómo querés programar las revisiones?",
+            reply_markup=menu_tipo_programacion(username, "variable"),
+        )
+        return
+
+    if data.startswith(("sched_mode_daily:", "schedv_mode_daily:")):
+        modalidad = "variable" if data.startswith("schedv_") else "normal"
         username = limpiar_username(
             data.split(":", 1)[1]
         )
 
-        context.user_data.clear()
-        context.user_data[SCHED_USERNAME] = username
+        if not conservar_flujo_programacion(context, username, modalidad):
+            await query.edit_message_text("Esta selección quedó desactualizada. Elegí nuevamente el perfil.",
+                                          reply_markup=menu_programaciones(modalidad))
+            return
 
         await query.edit_message_text(
             f"📅 @{username}\n\n"
             "¿Cuántas revisiones por día?",
             reply_markup=menu_cantidad(
-                username
+                username, modalidad
             ),
         )
         return
 
-    if data.startswith("sched_mode_interval:"):
+    if data.startswith(("sched_mode_interval:", "schedv_mode_interval:")):
+        modalidad = "variable" if data.startswith("schedv_") else "normal"
         username = limpiar_username(
             data.split(":", 1)[1]
         )
 
-        context.user_data.clear()
-        context.user_data[SCHED_USERNAME] = username
+        if not conservar_flujo_programacion(context, username, modalidad):
+            await query.edit_message_text("Esta selección quedó desactualizada. Elegí nuevamente el perfil.",
+                                          reply_markup=menu_programaciones(modalidad))
+            return
 
         await query.edit_message_text(
             f"⏱ @{username}\n\n"
@@ -2808,12 +3724,13 @@ async def callback(
             "Después vas a elegir el minuto exacto de la hora "
             "en que querés hacer las revisiones.",
             reply_markup=menu_intervalos(
-                username
+                username, modalidad
             ),
         )
         return
 
-    if data.startswith("sched_interval:"):
+    if data.startswith(("sched_interval:", "schedv_interval:")):
+        modalidad = "variable" if data.startswith("schedv_") else "normal"
         _, username, horas = data.split(
             ":",
             2,
@@ -2828,11 +3745,14 @@ async def callback(
         if not 1 <= horas <= 12:
             await query.edit_message_text(
                 "❌ Intervalo inválido.",
-                reply_markup=menu_programaciones(),
+                reply_markup=menu_programaciones(modalidad),
             )
             return
 
-        context.user_data.clear()
+        if not conservar_flujo_programacion(context, username, modalidad):
+            await query.edit_message_text("Esta selección quedó desactualizada. Elegí nuevamente el perfil.",
+                                          reply_markup=menu_programaciones(modalidad))
+            return
         context.user_data[STATE] = SCHED_INTERVAL_MINUTE
         context.user_data[SCHED_USERNAME] = username
         context.user_data[SCHED_INTERVAL_HOURS] = horas
@@ -2854,12 +3774,19 @@ async def callback(
         )
         return
 
-    if data.startswith("sched_count:"):
+    if data.startswith(("sched_count:", "schedv_count:")):
+        modalidad = "variable" if data.startswith("schedv_") else "normal"
         _, username, cantidad = data.split(":", 2)
         username = limpiar_username(username)
         cantidad = int(cantidad)
 
-        context.user_data.clear()
+        if not 1 <= cantidad <= 6:
+            await query.edit_message_text("Cantidad de revisiones inválida.", reply_markup=menu_programaciones(modalidad))
+            return
+        if not conservar_flujo_programacion(context, username, modalidad):
+            await query.edit_message_text("Esta selección quedó desactualizada. Elegí nuevamente el perfil.",
+                                          reply_markup=menu_programaciones(modalidad))
+            return
         context.user_data[STATE] = SCHED_TIMES
         context.user_data[SCHED_USERNAME] = username
         context.user_data[SCHED_COUNT] = cantidad
@@ -3676,70 +4603,110 @@ async def callback(
 
     if data == "status":
         await query.edit_message_text(
-            "⏳ <b>Verificando sesión web...</b>",
+            "⏳ <b>Comprobando el feed de las sesiones...</b>\nEsperando turno si hay otra consulta en curso.",
             parse_mode="HTML",
         )
-
         cuentas = cargar_cuentas()
-        programaciones = db.listar_programaciones(
-            AUTHORIZED_CHAT_ID
-        )
+        programaciones = db.listar_programaciones(AUTHORIZED_CHAT_ID)
+        progreso_lock = threading.Lock()
+        progreso = {}
+        detener = threading.Event()
+        cambio = asyncio.Event()
+        loop = asyncio.get_running_loop()
 
+        def recibir_progreso(datos):
+            with progreso_lock:
+                progreso.update(datos)
+            loop.call_soon_threadsafe(cambio.set)
+
+        async def refrescar_estado():
+            anterior = None
+            while True:
+                await cambio.wait()
+                cambio.clear()
+                with progreso_lock:
+                    actual = dict(progreso)
+                cuenta = actual.get("actual", {})
+                nombre = cuenta.get("username")
+                etiqueta = f"@{nombre} ({cuenta.get('id', '')})" if nombre else cuenta.get("id", "")
+                texto = (
+                    "⏳ <b>Comprobando el feed de las sesiones...</b>\n\n"
+                    f"Cuenta: <b>{esc(etiqueta)}</b>\n"
+                    f"Comprobadas: <b>{actual.get('procesadas', 0)}/{actual.get('total', 0)}</b>"
+                )
+                if texto != anterior:
+                    try:
+                        await query.edit_message_text(texto, parse_mode="HTML")
+                        anterior = texto
+                    except TelegramError:
+                        logger.warning("No se pudo actualizar el progreso de Estado.")
+                # Sólo regula las ediciones de Telegram; no pausa sesiones.
+                await asyncio.sleep(2)
+
+        tarea_progreso = asyncio.create_task(refrescar_estado())
         try:
             async with IG_LOCK:
-                sesion_web = await asyncio.to_thread(
-                    _comprobar_sesion_web_real
-                )
-
-            username_sesion = sesion_web.get("username")
-            if username_sesion:
-                cuenta_linea = (
-                    f"Sesión autenticada como: "
-                    f"<b>@{esc(username_sesion)}</b>\n"
-                )
-            else:
-                cuenta_linea = (
-                    "Sesión autenticada como: "
-                    "<i>no se pudo detectar el username</i>\n"
-                )
-
-            texto_estado = (
-                "ℹ️ <b>ESTADO</b>\n\n"
-                "Sesión web: ✅ <b>cargada</b>\n"
-                f"{cuenta_linea}"
-                "Acceso al feed: ✅ <b>normal</b> "
-                f"(HTTP {int(sesion_web.get('http_status', 200))})\n"
-                "Estado de seguridad: ✅ "
-                "<b>sin challenge/CAPTCHA detectado</b>\n"
-                "Sesión guardada/actualizada hace: "
-                f"<b>{esc(sesion_web.get('antiguedad_archivo', 'no disponible'))}</b>\n\n"
-                f"Cuentas: <b>{len(cuentas)}</b>\n"
-                f"Programaciones: <b>{len(programaciones)}</b>\n"
-                f"Historias: <code>{esc(str(HISTORYS_DIR))}</code>"
-            )
-
+                tarea_estado = asyncio.create_task(asyncio.to_thread(
+                    _estado_sesiones_feed, recibir_progreso, detener,
+                ))
+                try:
+                    estados = await asyncio.shield(tarea_estado)
+                except asyncio.CancelledError:
+                    detener.set()
+                    # Mantener el bloqueo hasta que el navegador termine evita
+                    # solapar el hilo cancelado con otra consulta de Instagram.
+                    await asyncio.shield(tarea_estado)
+                    raise
         except Exception as error:
-            logger.warning(
-                "Verificación de sesión web falló: %s",
-                error,
-            )
-            texto_estado = (
-                "ℹ️ <b>ESTADO</b>\n\n"
-                "Sesión web: ❌ <b>requiere atención</b>\n"
-                "Acceso al feed: ❌ <b>falló la verificación</b>\n"
-                f"Detalle: <code>{esc(str(error)[:500])}</code>\n"
-                "Sesión guardada/actualizada hace: "
-                f"<b>{esc(_antiguedad_archivo_sesion())}</b>\n\n"
-                f"Cuentas: <b>{len(cuentas)}</b>\n"
-                f"Programaciones: <b>{len(programaciones)}</b>\n"
-                f"Historias: <code>{esc(str(HISTORYS_DIR))}</code>"
-            )
+            estados = []
+            error_general = esc(str(error)[:600])
+        else:
+            error_general = None
+        finally:
+            tarea_progreso.cancel()
+            try:
+                await tarea_progreso
+            except asyncio.CancelledError:
+                pass
 
-        await query.edit_message_text(
-            texto_estado,
-            parse_mode="HTML",
-            reply_markup=menu_estado(),
+        cabecera = "ℹ️ <b>ESTADO DE SESIONES</b>\nComprobación actual del feed de Instagram.\n\n"
+        partes = []
+        texto = cabecera
+        if error_general:
+            texto += f"❌ No se pudo completar la comprobación: {error_general}\n\n"
+        elif not estados:
+            texto += "No hay sesiones habilitadas configuradas.\n\n"
+        for estado in estados:
+            nombre = estado.get("username")
+            etiqueta = f"@{nombre} ({estado['id']})" if nombre else estado["id"]
+            detalle = str(estado.get("detalle", ""))[:700]
+            bloque = (
+                f"{'✅' if estado['disponible'] else '❌'} <b>{esc(etiqueta)}</b>\n"
+                f"{esc(detalle)}\n\n"
+            )
+            if len(texto) + len(bloque) > 3600:
+                partes.append(texto)
+                texto = cabecera
+            texto += bloque
+        resumen = (
+            f"Perfiles: <b>{len(cuentas)}</b>\n"
+            f"Programaciones: <b>{len(programaciones)}</b>\n"
+            f"Historias: <code>{esc(str(HISTORYS_DIR))}</code>"
         )
+        if len(texto) + len(resumen) > 3900:
+            partes.append(texto)
+            texto = cabecera
+        partes.append(texto + resumen)
+        # Cada entrada conserva su HTML completo, sin omitir ninguna sesión.
+        await query.edit_message_text(
+            partes[0], parse_mode="HTML",
+            reply_markup=menu_estado() if len(partes) == 1 else None,
+        )
+        for indice, parte in enumerate(partes[1:], 1):
+            await enviar_texto_bot(
+                context, chat_id=AUTHORIZED_CHAT_ID, text=parte, parse_mode="HTML",
+                reply_markup=menu_estado() if indice == len(partes) - 1 else None,
+            )
         return
 
 
@@ -3824,7 +4791,7 @@ async def recibir_texto(
             return
 
         await responder_texto(update,
-            f"⏳ Verificando acceso a @{username}..."
+            f"⏳ Verificando acceso a @{username} con las sesiones disponibles..."
         )
 
         try:
@@ -3863,7 +4830,7 @@ async def recibir_texto(
                 (
                     f"🔒 La cuenta que querés añadir, @{username}, "
                     "es privada.\n\n"
-                    "La sesión de Instagram no tiene acceso a ese perfil, "
+                    "Ninguna de las sesiones de Instagram tiene acceso a ese perfil, "
                     "por lo tanto no fue agregada."
                 ),
                 reply_markup=menu_gestion(),
@@ -3871,30 +4838,6 @@ async def recibir_texto(
             return
 
         except RuntimeError as error:
-            detalle = str(error)
-
-            if (
-                "No pude confirmar si el perfil es público o privado"
-                in detalle
-            ):
-                logger.info(
-                    "No se agregó @%s: perfil privado o sin acceso confirmado.",
-                    username,
-                )
-                context.user_data.clear()
-
-                await responder_texto(
-                    update,
-                    (
-                        f"🔒 No se puede añadir @{username}.\n\n"
-                        "El perfil es privado o la sesión de Instagram "
-                        "no tiene acceso a esa cuenta.\n\n"
-                        "La cuenta no fue agregada."
-                    ),
-                    reply_markup=menu_gestion(),
-                )
-                return
-
             logger.exception(
                 "Error verificando acceso al agregar @%s",
                 username,
@@ -3938,9 +4881,13 @@ async def recibir_texto(
         guardar_cuentas(cuentas)
         context.user_data.clear()
 
+        sesion_nombre = perfil.get("sesion_username") or perfil.get("sesion_id", "principal")
+        cantidad_acceso = len(perfil.get("sesiones_con_acceso", []))
         await responder_texto(update,
             f"✅ @{username} agregada.\n"
-            f"Instagram ID: {user_id}",
+            f"Instagram ID: {user_id}\n"
+            f"Sesión preferida: {sesion_nombre}\n"
+            f"Sesiones con acceso: {cantidad_acceso}",
             reply_markup=menu_principal(),
         )
         return
@@ -4066,6 +5013,8 @@ async def recibir_texto(
             inicio_iso=inicio_local.astimezone(
                 timezone.utc
             ).isoformat(),
+            modalidad_sesiones=context.user_data.get(SCHED_MODALIDAD, "normal"),
+            sesiones_rotacion=context.user_data.get(SCHED_SESIONES, []),
         )
 
         row_guardada = db.obtener_programacion(
@@ -4105,8 +5054,7 @@ async def recibir_texto(
                 f"{texto_proxima_intervalo(row_guardada)} hs\n"
                 f"Multimedia automática: "
                 f"{'🔔 ACTIVADA' if notif else '🔕 DESACTIVADA'}\n\n"
-                "Crear la programación no hizo ninguna consulta "
-                "a Instagram."
+                f"{texto_modalidad_guardada(row_guardada)}"
             ),
             reply_markup=menu_programaciones(),
         )
@@ -4155,6 +5103,8 @@ async def recibir_texto(
             AUTHORIZED_CHAT_ID,
             username,
             horarios,
+            modalidad_sesiones=context.user_data.get(SCHED_MODALIDAD, "normal"),
+            sesiones_rotacion=context.user_data.get(SCHED_SESIONES, []),
         )
 
         registrar_jobs_programacion(
@@ -4181,7 +5131,7 @@ async def recibir_texto(
             f"Horarios Argentina: {' · '.join(horarios)}\n"
             f"Multimedia automática: "
             f"{'🔔 ACTIVADA' if notif else '🔕 DESACTIVADA'}\n\n"
-            "Crear la programación no hizo ninguna consulta a Instagram.",
+            f"{texto_modalidad_guardada(row_guardada)}",
             reply_markup=menu_programaciones(),
         )
         return
