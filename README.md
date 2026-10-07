@@ -1,7 +1,7 @@
-# StoryPulse Private
+# StoryPulse Private v2.0
 
 <p align="center">
-<img src="http://imgfz.com/i/Y7U30MS.png" title="StoryPulse">
+<img src="http://imgfz.com/i/QnmALpy.png" title="StoryPulse">
 </p>
 <br></br>
 
@@ -10,7 +10,7 @@
 
 <p align="center">
 <a href="https://github.com/FacuSecX"><img title="Autor" src="https://img.shields.io/badge/Author-Facu%20-blue?style=for-the-badge&logo=github"></a>
-<a href=""><img title="Version" src="https://img.shields.io/badge/Version-1.0-red?style=for-the-badge&logo="></a>
+<a href=""><img title="Version" src="https://img.shields.io/badge/Version-2.0-red?style=for-the-badge&logo="></a>
 </p>
 
 <p align="center">
@@ -21,10 +21,11 @@
 <p align="center">
 <a href="mailto:facusex@gmail.com"><img title="Correo" src="https://img.shields.io/badge/Correo-facusecX@gmail.com-blueviolet?style=for-the-badge&logo=gmai"></a>
 <a href="https://t.me/FacuSecX"><img title="Chat" src="https://img.shields.io/badge/CHAT-TELEGRAM-blue?style=for-thjlje-badge&logo=telegram"></a>
+</p>
 
-**StoryPulse Private** es un bot de Telegram para realizar consultas automatizadas a Instagram mediante una sesión web autenticada.
+**StoryPulse Private** es un bot de Telegram para realizar consultas automatizadas a Instagram mediante sesiones web independientes y previamente autenticadas.
 
-Permite monitorear perfiles públicos y también perfiles privados a los que la cuenta de Instagram utilizada para la autenticación tenga acceso, realizar revisiones automáticas, descargar Stories y publicaciones, almacenar el contenido localmente y mantener un registro persistente para evitar duplicados.
+Permite monitorear perfiles públicos y también perfiles privados a los que la cuenta de Instagram utilizada para la autenticación tenga acceso, realizar revisiones automáticas, descargar Stories, publicaciones e historias destacadas, almacenar el contenido localmente y mantener un registro persistente para evitar duplicados.
 
 Está pensado principalmente para ejecutarse de forma continua en un servidor o VPS.
 
@@ -47,19 +48,37 @@ Está pensado principalmente para ejecutarse de forma continua en un servidor o 
 - 📋 Programaciones persistentes almacenadas en SQLite.
 - 🔔 Notificaciones automáticas cuando se detectan Stories nuevas.
 - 🌐 Integración opcional con un panel web para visualizar el contenido almacenado.
-- 🩺 Verificación del estado de la sesión web de Instagram desde Telegram.
-- 🔄 Actualización manual del estado de sesión.
+- 🩺 Verificación del feed autenticado de cada sesión de Instagram desde Telegram.
+- 🔄 Comprobación manual del estado actual de las sesiones.
 - 🚫 No abre deliberadamente el visor convencional de Stories ni ejecuta llamadas destinadas específicamente a marcarlas como vistas.
 
 ---
 
-## Objetivo
+## Funcionalidades 2.0
+
+- 🔐 **Sistema multi-autenticación:** varias cuentas de Instagram con sus propias sesiones; si falla una consulta, se intenta con otra sesión habilitada que tenga acceso registrado al mismo perfil.
+- 🔄 **Programaciones variables entre sesiones:** elección de una o varias sesiones con acceso confirmado y rotación entre ellas en las revisiones automáticas, tanto por intervalos como por horarios específicos.
+- ✨ **Descarga de Highlights o historias destacadas:** imágenes y videos organizados por perfil y carrusel, con progreso y resumen desde Telegram.
+- 🎯 **Sesión preferida para cada cuenta monitoreada:** selección desde Telegram; la preferencia manual se conserva aunque una consulta necesite una alternativa autorizada.
+- 🛡️ **Antirepetición mejorada:** control persistente por IDs, compartido entre sesiones, filtrado de elementos repetidos y protección frente a revisiones manuales y automáticas simultáneas.
+- 🧹 **Reinicio selectivo de la antirepetición:** por perfil y por tipo de contenido —Stories, publicaciones o destacadas—, o de todos sus registros, con confirmación desde Telegram.
+- 🧩 **Actualizar sesiones:** comprobación de una sesión nueva contra los perfiles agregados para incorporarla como respaldo donde tenga acceso, conservando las preferencias y el avance de la comprobación.
+- ⭐ **Cuentas favoritas:** perfiles marcados con una estrella y botones destacados para encontrarlos fácilmente en los menús.
+- 💾 **Sesiones independientes y persistentes:** cada cuenta conserva su archivo de autenticación, su estado y sus asociaciones entre reinicios.
+
+---
+
+# Objetivo v2.0
+
+El sistema multi-autenticación está pensado para que, cuando falla la consulta de un perfil, pueda intentarse desde varias cuentas con acceso confirmado, reduciendo las revisiones manuales de las sesiones.
+
+La versión 2.0 mejora la continuidad de las consultas, permite elegir qué sesión utilizar para cada perfil y distribuir las revisiones automáticas entre sesiones autorizadas. Además, incorpora el archivo de historias destacadas y refuerza la antirepetición para conservar contenido de forma más ordenada y evitar envíos repetidos al cambiar de cuenta.
 
 StoryPulse Private está diseñado como una herramienta de monitoreo y organización automática de contenido de Instagram.
 
 Su objetivo es permitir revisar periódicamente determinados perfiles sin necesidad de comprobarlos manualmente, almacenar el contenido nuevo y evitar procesar repetidamente las mismas Stories o publicaciones.
 
-En el caso de los perfiles privados, StoryPulse solamente puede acceder al contenido que sea visible para la cuenta de Instagram utilizada para autenticar la sesión.
+En el caso de los perfiles privados, cada consulta sólo puede acceder al contenido visible para la cuenta de Instagram de la sesión utilizada. Tener varias sesiones no concede permisos adicionales.
 
 Ejemplo:
 
@@ -80,59 +99,71 @@ StoryPulse no proporciona acceso especial a perfiles privados. La visibilidad de
 
 ---
 
-## Funcionamiento de la autenticación
+## Sistema multi-autenticación
 
-StoryPulse no inicia sesión en Instagram con usuario y contraseña cada vez que realiza una consulta.
+StoryPulse no inicia sesión con usuario y contraseña cada vez que realiza una consulta. Reutiliza sesiones web autenticadas manualmente y mantiene sus cookies separadas por cuenta.
 
-En su lugar utiliza una sesión web previamente autenticada que se guarda en:
+### Cómo se generan las sesiones
 
-```text
-instagram_state.json
+Desde una computadora con interfaz gráfica se ejecuta `crear_session.py`. Para registrar cuentas independientes:
+
+```bash
+python crear_session.py
+python crear_session.py --cuenta cuenta_respaldo
 ```
 
-La sesión se genera mediante un script de creación de sesión, por ejemplo:
+El primer comando crea la sesión `principal` y el segundo agrega otra cuenta independiente. `cuenta_respaldo` es un ejemplo: debe reemplazarse por el username de la cuenta que iniciará sesión en Instagram, no por el perfil que se va a monitorear.
+
+El script abre un navegador mediante **Playwright**: Microsoft Edge por defecto, con alternativa Chromium. También se puede elegir Chrome o Chromium con `--navegador`. El inicio de sesión, el doble factor, los CAPTCHA y los checkpoints se completan manualmente. La exportación se realiza automáticamente cuando detecta una sesión autenticada estable; no hace falta presionar `ENTER`.
+
+### Dónde se guardan
 
 ```text
-crearsession.py
+instagram_state.json             # Sesión principal
+sesiones_instagram/
+└── cuenta_respaldo.json
+
+sesiones_instagram.json
+estado_sesiones_instagram.json
+perfiles_instagram/
 ```
 
-Durante ese proceso se abre un navegador Chromium controlado mediante **Playwright**.
+- `sesiones_instagram/<cuenta>.json`: estado autenticado de cada cuenta, incluidas sus cookies. Si la cuenta ya está registrada, el creador renueva la ruta configurada.
+- `sesiones_instagram.json`: configuración de sesiones, sus identificadores, archivos y estado habilitado. El creador registra cada sesión automáticamente.
+- `estado_sesiones_instagram.json`: preferencias por perfil, sesiones con acceso confirmado y resultados de consultas y actualizaciones. Se genera durante el uso del bot.
+- `perfiles_instagram/`: perfiles locales del navegador utilizados para crear o renovar las sesiones. Los de Chrome y Chromium usan sufijos propios; no se transfieren al VPS.
 
-El usuario inicia sesión manualmente en Instagram y completa cualquier CAPTCHA, checkpoint, código de seguridad o verificación que Instagram pueda solicitar.
+Se conserva compatibilidad con la sesión anterior: sin configuración multi-sesión, el bot utiliza la entrada `principal` y `instagram_state.json`, o la ruta indicada en `INSTAGRAM_STORAGE_STATE`. Ejecutar el creador sin `--cuenta` genera o renueva esa sesión principal y usa un perfil local independiente.
 
-Una vez que Instagram muestra correctamente la sesión iniciada, el script guarda el estado del navegador en:
+Las rutas de configuración y registro pueden ajustarse mediante `INSTAGRAM_SESSIONS_CONFIG` e `INSTAGRAM_SESSIONS_REGISTRY` en `.env`.
+
+### Cómo se elige una sesión
+
+Al agregar un perfil nuevo, el bot comprueba las sesiones disponibles y guarda cuáles confirmaron acceso. En las consultas normales empieza por la preferida y, si falla, utiliza únicamente alternativas habilitadas con acceso registrado al mismo perfil.
+
+Desde **Gestionar cuentas → Cambiar sesión preferida** puede elegirse la cuenta de Instagram para cada perfil. Si todavía no tiene acceso registrado, se verifica esa pareja antes de guardar el cambio. La preferida elegida manualmente se conserva aunque una revisión utilice otra cuenta.
+
+Después de copiar una sesión nueva al servidor, **Gestionar cuentas → Actualizar sesiones** permite comprobarla contra los perfiles agregados y añadirla como respaldo donde confirme acceso, sin cambiar las preferencias. El avance se conserva para continuar una comprobación pendiente.
+
+En una **programación variable**, se comprueba qué sesiones tienen acceso y se elige una o varias para rotar entre ellas. La rotación cambia la cuenta utilizada en cada ejecución; los intervalos y horarios se configuran por separado. La preferida normal del perfil permanece guardada.
+
+Una consulta correcta con cero Stories se informa como «sin historias»; no se interpreta como un fallo de autenticación ni obliga a probar otras cuentas.
 
 ```text
-instagram_state.json
+Inicio de sesión manual por cuenta
+        ↓
+Playwright + navegador visible
+        ↓
+JSON independiente por sesión + configuración
+        ↓
+Transferencia privada al VPS
+        ↓
+Perfil → sesión preferida / sesiones autorizadas
+        ↓
+Consulta a Instagram con la sesión elegida
 ```
 
-Ese archivo puede contener:
-
-- Cookies de Instagram.
-- Cookie `sessionid`.
-- Local Storage.
-- Estado del navegador relacionado con la sesión.
-- Otros datos necesarios para reutilizar la autenticación.
-
-El flujo general es:
-
-```text
-Inicio de sesión manual
-        ↓
-Instagram
-        ↓
-Playwright + Chromium
-        ↓
-Generación de instagram_state.json
-        ↓
-Archivo copiado al VPS
-        ↓
-StoryPulse carga la sesión
-        ↓
-Instagram reconoce la cuenta autenticada
-```
-
-De esta manera el bot no necesita almacenar la contraseña de Instagram ni iniciar sesión desde cero cada vez que realiza una revisión.
+El bot no necesita guardar las contraseñas de Instagram. Los JSON de sesión y los perfiles del navegador sí contienen credenciales reutilizables y deben mantenerse privados.
 
 ---
 
@@ -148,18 +179,18 @@ headless
 
 Esto significa que el navegador funciona completamente pero sin mostrar una ventana gráfica.
 
-StoryPulse crea el contexto del navegador utilizando el archivo de sesión:
+StoryPulse crea el contexto del navegador utilizando el archivo de la sesión seleccionada. De forma simplificada:
 
 ```python
 context = browser.new_context(
-    storage_state="instagram_state.json"
+    storage_state=str(obtener_ruta_sesion())
 )
 ```
 
 El funcionamiento simplificado es:
 
 ```text
-instagram_state.json
+JSON de la sesión seleccionada
         ↓
 Playwright
         ↓
@@ -183,11 +214,7 @@ En StoryPulse funciona principalmente como un navegador autenticado capaz de:
 - Detectar determinados errores HTTP.
 - Persistir cambios producidos en la sesión.
 
-Después de determinadas operaciones correctas, StoryPulse puede volver a exportar el estado actualizado del navegador y reemplazar el archivo:
-
-```text
-instagram_state.json
-```
+Después de determinadas operaciones correctas, StoryPulse puede volver a exportar el estado actualizado del navegador y reemplazar únicamente el JSON de la sesión que realizó la consulta.
 
 Esto permite conservar cookies o modificaciones realizadas por Instagram durante el funcionamiento normal.
 
@@ -339,6 +366,18 @@ Esto permite que, ante determinados fallos de Telegram o del servidor, una Story
 
 ---
 
+### Mejoras de antirepetición en v2.0
+
+- La identificación se realiza por el contenido y el perfil, sin depender de la cuenta de Instagram usada para consultar. Cambiar o rotar de sesión conserva los registros anteriores.
+- Las revisiones manuales y automáticas comparten una sección de procesamiento protegida para impedir que ambas envíen simultáneamente la misma Story.
+- Se filtran los IDs repetidos dentro de una misma respuesta de Instagram.
+- Las historias destacadas tienen registros propios por carrusel y Story ID; las publicaciones conservan sus propios IDs e información de sincronización.
+- Desde **Gestionar cuentas → Reiniciar antirepetición** puede elegirse un perfil y limpiar Stories, publicaciones, destacadas o todos sus registros. Se solicita confirmación antes de aplicar el cambio.
+
+El reinicio selectivo no elimina cuentas, programaciones, sesiones ni archivos descargados. Al limpiar publicaciones también se reinicia su avance de sincronización para permitir recorrer nuevamente el historial. Limpiar registros permite reprocesar contenido que continúe disponible; debe utilizarse de forma deliberada.
+
+---
+
 ## Stories y visualizaciones
 
 StoryPulse no abre deliberadamente el visor convencional de Stories utilizado normalmente desde la aplicación o la página de Instagram.
@@ -379,9 +418,31 @@ Los archivos son almacenados localmente en el servidor para permitir su conserva
 
 ---
 
+## Highlights o historias destacadas
+
+Desde **Historias destacadas** en el menú principal se elige un perfil agregado para descargar sus carruseles de destacadas. La consulta utiliza la sesión preferida y, si hace falta, otra sesión con acceso registrado al perfil.
+
+Las fotos y videos se conservan en el servidor, organizados por perfil y nombre del carrusel:
+
+```text
+HISTORYS_DIR/
+└── perfil_objetivo/
+    └── Higlights/
+        ├── viajes/
+        └── recuerdos/
+```
+
+`Higlights` es el nombre de carpeta utilizado por el código. Los títulos de los carruseles se normalizan para obtener nombres de carpeta válidos.
+
+Telegram muestra el progreso, que se actualiza aproximadamente cada diez segundos, y un resumen de archivos nuevos y ya guardados. Esta función descarga al almacenamiento local; no envía todos los archivos multimedia al chat.
+
+La antirepetición conserva el ID del carrusel y el ID original de cada Story. Repetir la consulta o utilizar otra sesión mantiene el registro del contenido ya descargado.
+
+---
+
 ## Gestión de perfiles privados
 
-Cuando se intenta agregar una nueva cuenta, StoryPulse verifica previamente si el perfil puede ser consultado por la sesión autenticada.
+Cuando se intenta agregar una nueva cuenta, StoryPulse verifica previamente cuáles de sus sesiones autenticadas pueden consultar el perfil.
 
 Ejemplo:
 
@@ -394,7 +455,7 @@ Consultar perfil
       ↓
 ¿Es privado?
       ↓
-¿La sesión tiene acceso?
+¿Alguna sesión confirma acceso?
       ↓
 Sí → Agregar
 No → Rechazar
@@ -404,37 +465,33 @@ De esta manera se evita agregar perfiles privados que posteriormente no podrían
 
 ---
 
-## Estado de sesión
+## Estado de las sesiones
 
-StoryPulse incluye una función de estado que permite comprobar la sesión web utilizada por el bot.
+La opción **Estado** de Telegram comprueba el feed autenticado de cada sesión habilitada. Muestra el progreso, el resultado actual de cada cuenta y un resumen de perfiles y programaciones.
 
-El sistema puede mostrar información similar a:
+La comprobación utiliza Instagram y se realiza de forma secuencial, esperando su turno si hay otra consulta en curso. No descarga Stories ni modifica la antirepetición, las preferencias o el historial de errores de las consultas.
 
-```text
-Sesión web: ✅ cargada
-Sesión autenticada como: @usuario
-Acceso a Instagram: ✅ normal
-Estado de seguridad: ✅ sin challenge detectado
-Sesión actualizada hace: 5 horas
-Cuentas: 36
-Programaciones: 30
-```
+El resultado corresponde al momento de la comprobación del feed: no garantiza acceso a todos los perfiles ni que una consulta posterior vaya a funcionar.
 
-La comprobación puede detectar situaciones como:
+Pueden aparecer situaciones como:
 
 ```text
-HTTP 400
-HTTP 401
-HTTP 403
-HTTP 429
+HTTP 400 / HTTP 401 / HTTP 403 / HTTP 429
 Redirección al login
-Challenge
-Checkpoint
-CAPTCHA
-Sesión inválida
+Challenge / Checkpoint / CAPTCHA
+Archivo ausente o inválido
+Sesión vencida
 ```
 
-El estado puede actualizarse nuevamente desde Telegram mediante el botón correspondiente.
+Para revisar únicamente archivos, cookies y errores registrados, sin conectar a Instagram, puede utilizarse:
+
+```bash
+python probar_sesion_vps.py --local
+```
+
+Este diagnóstico se identifica como **sin comprobación remota**. La existencia de cookies no garantiza que Instagram acepte la siguiente consulta.
+
+**Actualizar sesiones** es una función distinta: comprueba expresamente el acceso de una sesión nueva o pendiente a los perfiles agregados para incorporarla como respaldo donde corresponda.
 
 ---
 
@@ -545,68 +602,80 @@ python -m playwright install chromium
 
 ---
 
-# Generación de la sesión de Instagram
+# Generación de las sesiones de Instagram
 
-Antes de iniciar StoryPulse debe generarse una sesión autenticada.
+Antes de iniciar StoryPulse deben existir los JSON de las sesiones habilitadas. Se recomienda generarlos desde una computadora con interfaz gráfica.
 
-Se recomienda realizar este proceso desde una computadora con interfaz gráfica, por ejemplo Windows.
-
-Ejecutar:
+Para crear o renovar la sesión principal compatible con la versión anterior:
 
 ```bash
-python crearsession.py
+python crear_session.py
 ```
 
-El script abrirá Chromium mediante Playwright.
+Para agregar una segunda cuenta independiente, reemplazar el username de ejemplo:
+
+```bash
+python crear_session.py --cuenta cuenta_respaldo
+```
+
+El creador abre Edge por defecto y recurre a Chromium si no puede iniciarlo. Puede elegirse otro navegador:
+
+```bash
+python crear_session.py --cuenta cuenta_respaldo --navegador chromium
+python crear_session.py --cuenta cuenta_respaldo --navegador chrome
+```
 
 Dentro del navegador:
 
-1. Iniciar sesión manualmente en Instagram.
-2. Introducir usuario y contraseña.
-3. Completar cualquier código de seguridad si Instagram lo solicita.
-4. Resolver manualmente cualquier CAPTCHA o checkpoint.
-5. Esperar hasta comprobar que el feed de Instagram funciona normalmente.
-6. Volver a la consola.
-7. Presionar `ENTER` cuando el script lo solicite.
+1. Iniciar sesión manualmente con la cuenta que se está registrando.
+2. Completar el doble factor, los códigos de seguridad, CAPTCHA o checkpoints solicitados.
+3. Esperar hasta que Instagram funcione con la sesión iniciada.
+4. Mantener el navegador abierto mientras el script confirma el estado y exporta el JSON automáticamente.
+5. Comprobar en la consola que aparece «SESIÓN EXPORTADA».
 
-Al finalizar se generará:
+No hace falta presionar `ENTER`. El tiempo de espera inicial es de diez minutos y puede ampliarse con `--espera 1200`.
+
+El resultado predeterminado es:
 
 ```text
-instagram_state.json
+instagram_state.json                         # Principal
+sesiones_instagram/cuenta_respaldo.json       # Cuenta adicional
+sesiones_instagram.json                      # Registro de configuración
 ```
 
-Este archivo contiene la sesión autenticada que posteriormente utilizará StoryPulse.
+Si una cuenta ya está registrada, se renueva el archivo indicado en su configuración. Los perfiles del navegador quedan localmente en `perfil_instagram_playwright/` o `perfiles_instagram/`, con sufijos según el navegador cuando corresponda.
+
+El creador actualiza `sesiones_instagram.json` automáticamente. El script `crearsession.py` se conserva como alias compatible del creador nuevo y acepta los mismos argumentos. El archivo de ejemplo `sesiones_instagram.example.json` sirve como referencia para configuración manual; contiene placeholders y no sesiones utilizables. Su campo `version: 1` identifica el formato de configuración, no la versión del proyecto.
+
+La entrada `principal` se conserva por compatibilidad. Debe tener un archivo válido o estar deshabilitada explícitamente si la instalación sólo va a utilizar cuentas con nombre.
 
 ---
 
-## Importante: seguridad de instagram_state.json
+## Seguridad de los archivos de sesión
 
-El archivo:
+Todos los JSON de estado autenticado, incluido `instagram_state.json` y los de `sesiones_instagram/`, son credenciales sensibles. Pueden contener cookies, `sessionid`, Local Storage y otros datos que permiten reutilizar la autenticación.
 
-```text
-instagram_state.json
-```
-
-debe considerarse una credencial sensible.
-
-Una sesión válida puede permitir reutilizar la autenticación de Instagram sin introducir nuevamente la contraseña.
+Los perfiles del navegador también deben mantenerse privados. La configuración y el registro locales contienen usernames, asociaciones y datos de operación.
 
 Por este motivo:
 
-- No debe publicarse en GitHub.
-- No debe incluirse en releases.
-- No debe enviarse públicamente.
-- No debe compartirse con terceros.
-- No debe aparecer en capturas públicas.
-- No debe almacenarse en repositorios públicos.
-
-Debe agregarse a `.gitignore`.
+- No publicar sesiones, perfiles, configuraciones activas ni registros en GitHub.
+- No incluirlos en releases, ZIP públicos, capturas o mensajes públicos.
+- Compartir únicamente ejemplos con valores ficticios.
+- Mantenerlos excluidos mediante `.gitignore`.
 
 Ejemplo:
 
 ```gitignore
 .env
-instagram_state.json
+instagram_state*.json
+sesiones_instagram/
+sesiones_instagram.json
+estado_sesiones_instagram.json
+perfiles_instagram/
+perfil_instagram_playwright*/
+renovar_session_vps.local.json
+.renovacion_backup/
 *.db
 __pycache__/
 venv/
@@ -615,33 +684,38 @@ venv/
 
 ---
 
-# Transferir la sesión al servidor
+# Transferir las sesiones al servidor
 
-Una vez generado:
-
-```text
-instagram_state.json
-```
-
-debe copiarse a la carpeta del proyecto en el servidor.
+Copiar la configuración `sesiones_instagram.json` y los JSON de todas las sesiones habilitadas a la carpeta del proyecto en el VPS, conservando las rutas relativas.
 
 Ejemplo:
 
 ```text
-/home/usuario/StoryPulse-Private/instagram_state.json
+/home/usuario/StoryPulse-Private/
+├── instagram_state.json
+├── sesiones_instagram.json
+└── sesiones_instagram/
+    └── cuenta_respaldo.json
 ```
 
-Desde Windows puede utilizarse SCP:
+Desde Windows puede utilizarse SCP. Reemplazar `usuario` e `IP_DEL_SERVIDOR` por los datos de la propia instalación:
 
 ```powershell
-scp instagram_state.json usuario@IP_DEL_SERVIDOR:/home/usuario/StoryPulse-Private/
+scp instagram_state.json sesiones_instagram.json usuario@IP_DEL_SERVIDOR:/home/usuario/StoryPulse-Private/
+scp -r sesiones_instagram usuario@IP_DEL_SERVIDOR:/home/usuario/StoryPulse-Private/
 ```
 
-En el VPS es recomendable restringir sus permisos:
+No copiar los perfiles de navegador al VPS. `estado_sesiones_instagram.json` se genera allí y debe conservarse al actualizar el código; no se reemplaza con el registro de otra instalación.
+
+En el servidor, los archivos deben pertenecer al usuario que ejecuta el bot. Se recomienda restringir permisos:
 
 ```bash
-chmod 600 instagram_state.json
+chmod 600 instagram_state.json sesiones_instagram.json
+chmod 700 sesiones_instagram
+chmod 600 sesiones_instagram/*.json
 ```
+
+Al renovar archivos de una instalación activa, detener el servicio durante el reemplazo para evitar que una consulta en curso sobrescriba el JSON recién transferido. Conservar previamente una copia privada de la sesión anterior y reiniciar después de verificar los archivos.
 
 ---
 
@@ -662,6 +736,8 @@ TELEGRAM_BOT_TOKEN=TOKEN_DEL_BOT
 TELEGRAM_CHAT_ID=ID_DE_TELEGRAM
 
 INSTAGRAM_STORAGE_STATE=instagram_state.json
+INSTAGRAM_SESSIONS_CONFIG=sesiones_instagram.json
+INSTAGRAM_SESSIONS_REGISTRY=estado_sesiones_instagram.json
 
 HISTORYS_DIR=/home/usuario/historys
 
@@ -810,7 +886,7 @@ sudo journalctl -u storypulse.service -f
 
 # Actualización del proyecto
 
-Cuando se modifica el código puede reemplazarse únicamente el archivo correspondiente.
+Al actualizar a v2.0 deben reemplazarse todos los archivos incluidos en el paquete de actualización y añadirse los módulos nuevos. En cambios posteriores puede reemplazarse únicamente el archivo correspondiente.
 
 Por ejemplo:
 
@@ -818,8 +894,13 @@ Por ejemplo:
 bot.py
 history.py
 publicaciones.py
+highlights.py
+instagram_sessions.py
 database.py
+crear_session.py
 ```
+
+Conservar .env, las sesiones, sus configuraciones activas, cuentas.json, los registros locales y la base de datos. Las tablas nuevas se crean o migran automáticamente al iniciar el bot.
 
 Después reiniciar el servicio:
 
@@ -835,50 +916,39 @@ sudo systemctl status storypulse.service
 
 ---
 
-# Renovación de la sesión de Instagram
+# Renovación de una sesión de Instagram
 
-Una sesión de Instagram puede dejar de funcionar por diferentes motivos:
+Una sesión puede dejar de funcionar por vencimiento, cierre de sesión, cambios de contraseña, verificación de seguridad o invalidación por Instagram.
 
-- Expiración de cookies.
-- Cambio de contraseña.
-- Cierre manual de sesiones.
-- CAPTCHA.
-- Checkpoint de seguridad.
-- Challenge.
-- Actividad considerada inusual.
-- Invalidación de sesión por Instagram.
-- Cambios internos de la plataforma.
-
-Cuando ocurre alguno de estos casos pueden aparecer errores como:
-
-```text
-HTTP 400
-HTTP 401
-HTTP 403
-HTTP 429
-Redirección al login
-Challenge
-Checkpoint
-Session invalid
-```
-
-En ese caso debe generarse nuevamente la sesión.
-
-Ejecutar desde una computadora con navegador:
+Renovar únicamente la cuenta afectada desde una computadora con navegador:
 
 ```bash
-python crearsession.py
+python crear_session.py --cuenta cuenta_respaldo
 ```
 
-Iniciar sesión nuevamente y completar cualquier verificación manual.
+Para la sesión principal:
 
-Después reemplazar en el servidor:
-
-```text
-instagram_state.json
+```bash
+python crear_session.py
 ```
 
-y reiniciar StoryPulse:
+Completar manualmente las verificaciones y esperar la exportación. Copiar el JSON renovado a su ruta configurada en el VPS, conservando las sesiones y asociaciones de las demás cuentas.
+
+Si es necesario renovar un archivo que utiliza un alias, el creador permite indicar la ruta exacta con `--archivo-sesion`. No se debe cambiar la identidad de la cuenta asociada a un JSON existente.
+
+El programa vuelve a considerar una sesión cuyo JSON haya cambiado. Si continúa apareciendo un error de login o CAPTCHA, comprobar el inicio de sesión manual antes de exportar nuevamente.
+
+## Renovación asistida en Windows
+
+`RENOVAR_SESSION.bat` y `renovar_session_vps.py` permiten elegir un JSON de `sesiones_instagram/`, renovarlo con su perfil local y transferir únicamente ese archivo al VPS mediante WinSCP.
+
+Copiar `renovar_session_vps.config.ejemplo.json` a `renovar_session_vps.local.json` y completar los datos de la propia instalación. La configuración privada, la llave PPK y los backups locales nunca se publican.
+
+La herramienta requiere Playwright, WinSCP, la llave y sus rutas configuradas. La entrada principal, guardada fuera de `sesiones_instagram/`, se renueva con el creador directamente.
+
+El proceso comprueba el JSON y la identidad de la sesión, reemplaza el archivo remoto con el servicio detenido y verifica el reinicio. Si falla, conserva o intenta restaurar la sesión anterior según la etapa. Un fallo de transferencia requiere revisar el estado del servidor antes de volver a ejecutar.
+
+Después de una transferencia manual, reiniciar el servicio de la propia instalación:
 
 ```bash
 sudo systemctl restart storypulse.service
@@ -919,51 +989,84 @@ Por este motivo se recomienda:
 
 # Seguridad
 
-Los principales archivos sensibles del proyecto son:
+Los archivos privados de una instalación incluyen:
 
 ```text
 .env
 instagram_state.json
+sesiones_instagram/*.json
+sesiones_instagram.json
+estado_sesiones_instagram.json
+perfiles_instagram/
+perfil_instagram_playwright*/
+cuentas.json
+user_ids_cache.json
+bot_historias.db
+renovar_session_vps.local.json
+.renovacion_backup/
+Llaves privadas SSH / PPK
+Logs y contenido descargado
 ```
 
-Estos archivos nunca deberían publicarse.
+Los ejemplos publicados contienen placeholders. Cada instalación debe crear sus archivos privados localmente.
 
 Ejemplo recomendado de `.gitignore`:
 
 ```gitignore
-# Credenciales
+# Credenciales y configuración privada
 .env
+.env.*
+!.env.example
+*.ppk
+*.pem
+*.key
+renovar_session_vps.local.json
+.renovacion_backup/
 
-# Sesión de Instagram
-instagram_state.json
+# Sesiones, asociaciones y perfiles locales
+instagram_state*.json
+sesiones_instagram/
+sesiones_instagram.json
+estado_sesiones_instagram.json
+perfiles_instagram/
+perfil_instagram_playwright*/
+
+# Perfiles consultados y caché
+cuentas.json
+user_ids_cache.json
 
 # Bases de datos locales
 *.db
+*.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 
-# Python
+# Python y entornos virtuales
 __pycache__/
 *.pyc
 *.pyo
-
-# Entornos virtuales
 venv/
 .venv/
 
-# Playwright
+# Navegadores, logs y contenido descargado
 .pw-browsers/
-
-# Logs
 *.log
+historys/
 ```
 
 También se recomienda restringir los permisos en Linux:
 
 ```bash
-chmod 600 .env
-chmod 600 instagram_state.json
+chmod 600 .env instagram_state.json sesiones_instagram.json
+chmod 700 sesiones_instagram
+chmod 600 sesiones_instagram/*.json
 ```
+
+Aplicar `chmod 600` a `estado_sesiones_instagram.json` cuando exista. Las rutas personalizadas también deben protegerse y excluirse del repositorio.
+
+`.gitignore` no elimina archivos que ya estén versionados: si una sesión o token se publicó anteriormente, debe retirarse del historial y renovarse la credencial.
 
 ---
 
@@ -972,54 +1075,37 @@ chmod 600 instagram_state.json
 El funcionamiento general puede resumirse de la siguiente manera:
 
 ```text
-┌─────────────────────────┐
-│        Telegram         │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│         bot.py          │
-│                         │
-│ Menús                   │
-│ Programaciones          │
-│ Gestión de cuentas      │
-│ Antirepetición          │
-│ Notificaciones          │
-└────────────┬────────────┘
-             │
-       ┌─────┴─────┐
-       │           │
-       ▼           ▼
-┌────────────┐ ┌──────────────────┐
-│ history.py │ │ publicaciones.py │
-└─────┬──────┘ └────────┬─────────┘
-      │                 │
-      └────────┬────────┘
-               │
-               ▼
-┌─────────────────────────┐
-│  Playwright + Chromium  │
-│        Headless         │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│  instagram_state.json   │
-│                         │
-│ Sesión web autenticada  │
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│      Instagram Web      │
-│                         │
-│ GraphQL                 │
-│ CDN                     │
-│ Perfil                  │
-│ Stories                 │
-│ Publicaciones           │
-└─────────────────────────┘
+Telegram
+   │
+   ▼
+bot.py ────────────────────────────────► database.py / SQLite
+   │                                      │
+   │                                      ├── Programaciones y rotación
+   │                                      └── IDs de antirepetición
+   ▼
+instagram_sessions.py
+   │
+   ├── Configuración de sesiones
+   ├── Preferida y accesos por perfil
+   └── JSON independiente por cuenta
+   │
+   ▼
+history.py / publicaciones.py / highlights.py
+   │
+   ▼
+Playwright + Chromium Headless
+   │
+   ▼
+Instagram Web / GraphQL / CDN
+   │
+   ▼
+Contenido y metadatos en HISTORYS_DIR
+   │
+   ├── Stories → Telegram según la revisión y sus ajustes
+   └── Publicaciones y destacadas → archivos locales y resumen
 ```
+
+`crear_session.py` genera o renueva las sesiones en una computadora con navegador visible. La configuración de sesiones y sus JSON se transfieren privadamente al servidor; el estado de preferencias y accesos se conserva allí.
 
 ---
 
@@ -1032,7 +1118,10 @@ Entre los datos que pueden almacenarse se encuentran:
 ```text
 Stories procesadas
 Story IDs
+IDs de publicaciones y destacadas
+Avance de sincronización de publicaciones
 Programaciones
+Sesiones elegidas y último turno de rotación
 Estados de programación
 Mensajes registrados
 Información necesaria para antirepetición
@@ -1044,25 +1133,47 @@ Esto permite que el sistema conserve su estado incluso después de reiniciar el 
 
 # Archivos principales
 
-Una instalación típica puede contener:
+Código y ejemplos publicados:
 
 ```text
 StoryPulse-Private/
-│
 ├── bot.py
 ├── history.py
 ├── publicaciones.py
+├── highlights.py
+├── instagram_sessions.py
 ├── database.py
+├── crear_session.py
 ├── crearsession.py
+├── probar_sesion_vps.py
+├── renovar_session_vps.py
+├── RENOVAR_SESSION.bat
+├── renovar_session_vps.config.ejemplo.json
+├── sesiones_instagram.example.json
 ├── requirements.txt
-├── cuentas.json
-├── user_ids_cache.json
-├── instagram_state.json
-├── bot_historias.db
-└── .env
+├── server_install.sh
+├── README.md
+├── .env.example
+└── .gitignore
 ```
 
-Algunos archivos pueden generarse automáticamente durante la ejecución.
+Archivos privados creados o configurados en cada instalación:
+
+```text
+.env
+cuentas.json
+user_ids_cache.json
+instagram_state.json
+sesiones_instagram.json
+sesiones_instagram/
+estado_sesiones_instagram.json
+perfiles_instagram/
+perfil_instagram_playwright*/
+bot_historias.db
+renovar_session_vps.local.json
+```
+
+Algunos archivos se generan automáticamente durante la ejecución. Los datos privados no forman parte del repositorio ni del paquete de actualización.
 
 ---
 
@@ -1099,7 +1210,7 @@ StoryPulse no evita controles de privacidad de Instagram y no proporciona acceso
 El comportamiento relacionado con visualizaciones de Stories, endpoints internos y mecanismos de Instagram puede cambiar en cualquier momento.
 
 
-## Instalacion en servidores
+## Instalación en servidores
 
 En el servidor ejecuta
 
@@ -1107,5 +1218,3 @@ En el servidor ejecuta
 chmod +x server_install.sh
 sudo ./server_install.sh
 ```
-
-
