@@ -1,5 +1,5 @@
-# Bot Telegram StoryPulse v1.0
-# https://github.com/FacuSecX/
+# StoryPulse v2.0
+# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
 from __future__ import annotations
 
@@ -9,28 +9,29 @@ import mimetypes
 import os
 import re
 import threading
+import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
 from playwright.sync_api import sync_playwright
+from instagram_sessions import (
+    SinHistoriasDisponibles, PerfilPrivado, PerfilNoEncontrado,
+    ErrorSesionInstagram, ErrorConsultaInstagram, comprobar_archivo_sesion, con_sesiones,
+    obtener_ruta_sesion, guardar_estado_contexto, escribir_json_atomico, sesion_actual, usar_sesion,
+    usar_playwright_sincronico,
+    validar_respuesta_instagram, validar_pagina_instagram, validar_datos_instagram,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
-
-_state_env = os.getenv(
-    "INSTAGRAM_STORAGE_STATE",
-    "instagram_state.json",
-).strip()
-
-RUTA_SESION = Path(_state_env).expanduser()
-if not RUTA_SESION.is_absolute():
-    RUTA_SESION = BASE_DIR / RUTA_SESION
 
 RUTA_CACHE_IDS = BASE_DIR / "user_ids_cache.json"
 
@@ -50,18 +51,6 @@ ZONA_LOCAL = os.getenv(
 ).strip()
 
 _BLOQUEO = threading.RLock()
-
-
-class SinHistoriasDisponibles(RuntimeError):
-    pass
-
-
-class PerfilPrivado(RuntimeError):
-    pass
-
-
-class PerfilNoEncontrado(RuntimeError):
-    pass
 
 
 @dataclass
@@ -104,59 +93,9 @@ def limpiar_username(valor: str) -> str:
     return username.lower()
 
 
-def _leer_estado() -> dict[str, Any]:
-    if not RUTA_SESION.exists():
-        raise FileNotFoundError(
-            f"No existe {RUTA_SESION}. "
-            "Primero crea instagram_state.json en Windows y cópialo al VPS."
-        )
-
-    try:
-        data = json.loads(RUTA_SESION.read_text(encoding="utf-8"))
-    except Exception as error:
-        raise RuntimeError(
-            "instagram_state.json no contiene JSON válido."
-        ) from error
-
-    if not isinstance(data, dict):
-        raise RuntimeError("instagram_state.json tiene un formato inválido.")
-
-    return data
-
-
 def comprobar_sesion_local() -> dict[str, Any]:
-    """
-    Comprueba localmente que storage_state contiene sessionid.
-    NO hace ninguna consulta a Instagram.
-    """
-    data = _leer_estado()
-    cookies = data.get("cookies") or []
-
-    sessionid_presente = False
-    dominios = set()
-
-    if isinstance(cookies, list):
-        for cookie in cookies:
-            if not isinstance(cookie, dict):
-                continue
-
-            dominio = str(cookie.get("domain", ""))
-            if dominio:
-                dominios.add(dominio)
-
-            if cookie.get("name") == "sessionid" and cookie.get("value"):
-                sessionid_presente = True
-
-    if not sessionid_presente:
-        raise RuntimeError(
-            "instagram_state.json existe pero no contiene una cookie sessionid."
-        )
-
-    return {
-        "session_file": str(RUTA_SESION.resolve()),
-        "sessionid_presente": True,
-        "dominios": sorted(dominios),
-    }
+    """Valida localmente el archivo de la sesión seleccionada, sin consultas."""
+    return comprobar_archivo_sesion()
 
 
 def _cargar_cache() -> dict[str, int]:
@@ -262,7 +201,7 @@ def _crear_contexto(playwright):
     )
 
     context = browser.new_context(
-        storage_state=str(RUTA_SESION),
+        storage_state=str(obtener_ruta_sesion()),
         viewport={"width": 1365, "height": 900},
         locale="es-AR",
         timezone_id=ZONA_LOCAL,
@@ -272,49 +211,10 @@ def _crear_contexto(playwright):
 
 
 def _guardar_estado_contexto(context) -> None:
-    """
-    Conserva cookies/local storage actualizados después de una
-    operación correcta.
-
-    Se escribe primero en un temporal y luego se reemplaza el JSON
-    para reducir el riesgo de dejarlo incompleto si el proceso muere.
-    """
-    temporal = RUTA_SESION.with_name(
-        RUTA_SESION.name + ".tmp"
-    )
-
-    try:
-        try:
-            context.storage_state(
-                path=str(temporal),
-                indexed_db=True,
-            )
-        except TypeError:
-            # Compatibilidad con versiones de Playwright que no
-            # acepten todavía indexed_db como argumento.
-            context.storage_state(
-                path=str(temporal)
-            )
-
-        os.replace(
-            temporal,
-            RUTA_SESION,
-        )
-
-        try:
-            RUTA_SESION.chmod(0o600)
-        except OSError:
-            pass
-
-    finally:
-        try:
-            temporal.unlink(
-                missing_ok=True
-            )
-        except OSError:
-            pass
+    guardar_estado_contexto(context)
 
 
+@con_sesiones(vincular=False)
 def resolver_user_id(
     username: str,
     *,
@@ -337,7 +237,7 @@ def resolver_user_id(
 
         candidatos: list[int] = []
 
-        with sync_playwright() as p:
+        with usar_playwright_sincronico(sync_playwright) as p:
             browser, context = _crear_contexto(p)
 
             try:
@@ -381,29 +281,11 @@ def resolver_user_id(
                     timeout=60_000,
                 )
 
-                if response is None:
-                    raise RuntimeError(
-                        f"Instagram no devolvió respuesta para @{username}."
-                    )
-
-                if response.status == 404:
-                    raise PerfilNoEncontrado(
-                        f"No se encontró @{username}."
-                    )
-
-                if response.status >= 400:
-                    raise RuntimeError(
-                        f"Instagram respondió HTTP {response.status} "
-                        f"al abrir @{username}."
-                    )
+                validar_respuesta_instagram(page, response, f"abrir @{username}")
 
                 page.wait_for_timeout(7_000)
 
-                if "/accounts/login" in page.url.lower():
-                    raise RuntimeError(
-                        "Instagram redirigió al login. "
-                        "La sesión web ya no es válida."
-                    )
+                validar_pagina_instagram(page)
 
                 try:
                     html = page.content()
@@ -431,7 +313,7 @@ def resolver_user_id(
             )
 
         if len(candidatos) > 1:
-            raise RuntimeError(
+            raise ErrorConsultaInstagram(
                 f"Instagram devolvió más de un ID candidato para @{username}: "
                 + ", ".join(map(str, candidatos))
             )
@@ -443,7 +325,7 @@ def resolver_user_id(
         return user_id
 
 
-def _construir_profile_info_url(username: str) -> str:
+def _construir_profile_info_url(username: str, *, sin_historias: bool = False) -> str:
     """
     Consulta de perfil autenticada que pide explícitamente la información
     de relación entre la sesión y el perfil objetivo.
@@ -452,8 +334,8 @@ def _construir_profile_info_url(username: str) -> str:
         "data": {
             "count": 1,
             "include_relationship_info": True,
-            "latest_besties_reel_media": True,
-            "latest_reel_media": True,
+            "latest_besties_reel_media": not sin_historias,
+            "latest_reel_media": not sin_historias,
         },
         "username": username,
         "__relay_internal__pv__PolarisIsLoggedInrelayprovider": True,
@@ -537,7 +419,9 @@ def _extraer_estado_perfil(
                 }
             )
 
-    def recorrer(valor: Any, padre: dict[str, Any] | None = None) -> None:
+    def recorrer(valor: Any, padre: dict[str, Any] | None = None, profundidad: int = 0) -> None:
+        if profundidad > 60:
+            return
         if isinstance(valor, dict):
             agregar_desde_dict(valor, padre)
 
@@ -546,24 +430,455 @@ def _extraer_estado_perfil(
                 agregar_desde_dict(usuario_hijo, valor)
 
             for hijo in valor.values():
-                recorrer(hijo, valor)
+                recorrer(hijo, valor, profundidad + 1)
 
         elif isinstance(valor, list):
             for hijo in valor:
-                recorrer(hijo, padre)
+                recorrer(hijo, padre, profundidad + 1)
+        elif isinstance(valor, str) and objetivo in valor.casefold() and valor.lstrip().startswith(("{", "[")):
+            try:
+                recorrer(json.loads(valor), padre, profundidad + 1)
+            except (ValueError, RecursionError):
+                pass
 
     recorrer(obj)
     return encontrados
 
 
-def comprobar_perfil_accesible(username: str) -> dict[str, Any]:
+def _resumir_estado_perfil(estados, username: str, user_id: int):
+    ids = {int(e["user_id"]) for e in estados if e.get("user_id")}
+    if any(uid != user_id for uid in ids):
+        raise ErrorConsultaInstagram(f"Instagram devolvió un ID inconsistente para @{username}.")
+    privados = [e["is_private"] for e in estados if e.get("is_private") is not None]
+    seguimientos = [e["following"] for e in estados if e.get("following") is not None]
+    privado = True if True in privados else (False if False in privados else None)
+    siguiendo = True if True in seguimientos else (False if False in seguimientos else None)
+    return privado, siguiendo
+
+
+def _estados_en_html(html: str, username: str):
+    class ScriptsJSON(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.partes = None
+            self.estados = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "script" and dict(attrs).get("type", "").lower() in ("application/json", "text/json"):
+                self.partes = []
+
+        def handle_data(self, data):
+            if self.partes is not None:
+                self.partes.append(data)
+
+        def handle_endtag(self, tag):
+            if tag == "script" and self.partes is not None:
+                try:
+                    self.estados.extend(_extraer_estado_perfil(json.loads("".join(self.partes)), username))
+                except (ValueError, RecursionError):
+                    pass
+                self.partes = None
+
+    parser = ScriptsJSON()
+    parser.feed(html)
+    return parser.estados
+
+
+def _ruta_publicacion_del_perfil(ruta: str, username: str) -> bool:
+    """Formatos Web antiguos y actuales; nunca enlaces a otro perfil."""
+    partes = str(ruta).strip("/").split("/")
+    if len(partes) == 3:
+        if partes[0].casefold() != username.casefold():
+            return False
+        partes = partes[1:]
+    return (len(partes) == 2 and partes[0] in ("p", "reel")
+            and re.fullmatch(r"[A-Za-z0-9_-]+", partes[1]) is not None)
+
+
+def _visual_perfil_cargado(page) -> dict[str, Any]:
+    """Sólo observa la página; no abre publicaciones ni el visor de Stories."""
+    visual = page.evaluate("""() => {
+        const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+        const main = document.querySelector('main,[role="main"]');
+        const header = main && main.querySelector('header');
+        const candidatos = main ? [...main.querySelectorAll('a[href]')].filter(e => {
+            if (!visible(e) || e.closest('header,aside,nav,[role="navigation"]')) return false;
+            if (e.closest('[aria-label="Sugerencias para ti"],[aria-label="Suggested for you"],[data-testid*="suggest"]')) return false;
+            const zona = e.closest('section,[role="region"]');
+            const tituloZona = zona && zona.querySelector('h2,h3,[role="heading"]');
+            if (tituloZona && /^(sugerencias para ti|suggested for you|suggestions for you|recommended for you)$/i.test(tituloZona.innerText.trim())) return false;
+            const miniatura = e.querySelector('img,video');
+            if (!miniatura || !visible(miniatura)) return false;
+            const url = new URL(e.href, location.href);
+            return ['instagram.com','www.instagram.com'].includes(url.hostname);
+        }).map(e => new URL(e.href, location.href).pathname) : [];
+        return {
+            titulos: header ? [...header.querySelectorAll('h1,h2')].filter(visible).map(e => e.textContent.trim()) : [],
+            botones: header ? [...header.querySelectorAll('button,[role="button"]')].filter(visible)
+                .map(e => (e.innerText || e.getAttribute('aria-label') || '').trim()) : [],
+            enlaces_publicaciones: candidatos,
+            login: [...document.querySelectorAll('input[type="password"]')].some(visible),
+            captcha: [...document.querySelectorAll('iframe[src*="recaptcha"],iframe[src*="hcaptcha"]')].some(visible),
+            autenticado: [...document.querySelectorAll('a[href*="/direct/inbox"],a[href*="/accounts/edit"]')].some(visible),
+            login_invitado: [...document.querySelectorAll('header a[href*="/accounts/login"],main a[href*="/accounts/login"]')].some(visible),
+            texto: main ? main.innerText : document.body.innerText
+        };
+    }""")
+    if isinstance(visual, dict) and "enlaces_publicaciones" in visual:
+        username = urlsplit(str(page.url)).path.strip("/").casefold()
+        visual["publicaciones"] = any(_ruta_publicacion_del_perfil(ruta, username)
+                                       for ruta in visual["enlaces_publicaciones"])
+    return visual
+
+
+def _datos_json_respuesta_recibida(response) -> list[Any]:
+    """Decodifica datos ya recibidos; no ejecuta JavaScript ni hace consultas.
+
+    Instagram también entrega JSON con prefijo anti-XSSI bajo text/javascript,
+    y algunas respuestas Relay contienen varios objetos JSON consecutivos.
+    """
+    ctype = response.headers.get("content-type", "").lower()
+    if "json" not in ctype and "javascript" not in ctype:
+        return []
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+    if isinstance(data, (dict, list)):
+        return [data]
+    try:
+        texto = response.text()
+    except Exception:
+        return []
+    if not isinstance(texto, str) or len(texto) > 8_000_000:
+        return []
+    texto = texto.lstrip("\ufeff \t\r\n")
+    texto = re.sub(r"^(?:for\s*\(\s*;\s*;\s*\)|while\s*\(\s*1\s*\))\s*;\s*", "", texto, count=1)
+    if texto.startswith(")]}'"):
+        texto = texto[4:].lstrip(", \t\r\n")
+    decoder = json.JSONDecoder()
+    encontrados = []
+    posicion = 0
+    while posicion < len(texto) and len(encontrados) < 128:
+        while posicion < len(texto) and texto[posicion].isspace():
+            posicion += 1
+        if posicion == len(texto):
+            break
+        if texto[posicion] not in "{[":
+            return []  # Nunca interpretar código JavaScript o valores sueltos.
+        try:
+            valor, posicion = decoder.raw_decode(texto, posicion)
+        except (ValueError, RecursionError):
+            return []
+        if not isinstance(valor, (dict, list)):
+            return []
+        encontrados.append(valor)
+    return encontrados if posicion == len(texto) else []
+
+
+@contextmanager
+def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
+    """Un lote de accesos mediante una sola apertura normal de cada perfil.
+
+    El navegador se crea en la primera llamada, bajo la sesión elegida por el
+    actualizador. Se reutilizan su contexto y página hasta cerrar el lote.
+    No se resuelven IDs por red, ni se consultan endpoints adicionales.
+    """
+    stack = ExitStack()
+    recursos: dict[str, Any] = {}
+    observacion: dict[str, Any] = {"username": None, "estados": [], "errores": [], "generacion": 0}
+    solicitudes: dict[Any, int] = {}
+
+    def iniciar():
+        actual = sesion_actual()
+        if actual is None:
+            raise ErrorSesionInstagram("archivo", "No hay una sesión seleccionada para comprobar perfiles.")
+        if recursos:
+            if actual != recursos["sesion"]:
+                raise ErrorConsultaInstagram("La sesión cambió durante la comprobación de perfiles.")
+            return recursos["page"]
+        comprobar_sesion_local()
+        stack.enter_context(_BLOQUEO)
+        playwright = stack.enter_context(usar_playwright_sincronico(sync_playwright))
+        browser, context = _crear_contexto(playwright)
+        stack.callback(browser.close)
+        stack.callback(context.close)
+        page = context.new_page()
+        stack.callback(page.close)
+        recursos.update(sesion=actual, context=context, page=page, ultimo_estado=None)
+
+        def solicitud_iniciada(request):
+            # Una respuesta tardía de la página anterior no pertenece al perfil
+            # actual, aunque su cuerpo incluya su nombre entre recomendaciones.
+            solicitudes[request] = observacion["generacion"]
+
+        def solicitud_terminada(request):
+            """Lee respuestas que el perfil ya pidió; nunca inicia consultas."""
+            objetivo = observacion["username"]
+            if not objetivo or solicitudes.pop(request, None) != observacion["generacion"]:
+                return
+            try:
+                origen = request.headers.get("referer", "")
+                url_origen = urlsplit(origen)
+                # Las peticiones al subdominio i.instagram.com pueden llevar
+                # sólo el origen por Referrer-Policy, sin la ruta del perfil.
+                # La generación sigue acotada a esta navegación y el frame
+                # aporta su ruta exacta, sin pedir ningún recurso adicional.
+                if not origen or (url_origen.hostname in ("instagram.com", "www.instagram.com")
+                                  and not url_origen.path.rstrip("/")):
+                    url_origen = urlsplit(str(request.frame.url))
+                if url_origen.hostname not in ("instagram.com", "www.instagram.com"):
+                    return
+                if url_origen.path.rstrip("/").casefold() != "/" + objetivo:
+                    return
+                response = request.response()
+                if response is None:
+                    return
+                url = urlsplit(response.url)
+                if url.hostname not in ("instagram.com", "www.instagram.com", "i.instagram.com"):
+                    return
+                if not any(ruta in url.path for ruta in ("/api/", "/graphql/")):
+                    return
+                if int(response.status) == 429:
+                    observacion["errores"].append(ErrorSesionInstagram(
+                        "rate_limit", f"Instagram respondió HTTP 429 al cargar el perfil de @{objetivo}.", http_status=429,
+                    ))
+                for data in _datos_json_respuesta_recibida(response):
+                    observacion["estados"].extend(_extraer_estado_perfil(data, objetivo))
+                    # Un recurso accesorio rechazado no invalida un perfil visible.
+                    # Se conserva el diagnóstico sólo si la página no confirma acceso.
+                    try:
+                        validar_datos_instagram(data)
+                    except ErrorSesionInstagram as error:
+                        observacion["errores"].append(error)
+            except Exception:
+                pass
+
+        page.on("request", solicitud_iniciada)
+        page.on("requestfinished", solicitud_terminada)
+        return page
+
+    def verificar(username: str, *, user_id: int | None = None) -> dict[str, Any]:
+        username = limpiar_username(username)
+        page = iniciar()
+        solicitudes.clear()
+        observacion.update(username=username, estados=[], errores=[], generacion=observacion["generacion"] + 1)
+        conocido = user_id if user_id is not None else _cargar_cache().get(username)
+        try:
+            conocido = int(conocido) if conocido is not None else None
+        except (TypeError, ValueError):
+            conocido = None
+        if conocido is not None and conocido <= 0:
+            conocido = None
+        response = page.goto(
+            f"https://www.instagram.com/{username}/",
+            wait_until="domcontentloaded", timeout=60_000,
+        )
+        # HTTP de la navegación y redirecciones reales sí detienen el lote.
+        validar_respuesta_instagram(page, response, f"abrir el perfil de @{username}")
+        limite = time.monotonic() + max(0.0, float(espera_maxima))
+        while True:
+            validar_pagina_instagram(page)
+            ruta = urlsplit(str(page.url)).path.rstrip("/").casefold()
+            if ruta != "/" + username:
+                raise ErrorConsultaInstagram("Instagram abrió una página distinta del perfil solicitado.")
+            estados = list(observacion["estados"])
+            try:
+                estados.extend(_estados_en_html(page.content(), username))
+            except Exception:
+                pass
+            ids = {int(e["user_id"]) for e in estados if e.get("user_id")}
+            if (conocido is not None and any(uid != conocido for uid in ids)) or len(ids) > 1:
+                raise ErrorConsultaInstagram(f"Instagram devolvió un ID inconsistente para @{username}.")
+            uid = conocido or next(iter(ids), None)
+            privados = [e["is_private"] for e in estados if e.get("is_private") is not None]
+            siguiendo_valores = [e["following"] for e in estados if e.get("following") is not None]
+            privado = True if True in privados else (False if False in privados else None)
+            siguiendo = True if True in siguiendo_valores else (False if False in siguiendo_valores else None)
+            visual = _visual_perfil_cargado(page)
+            visual = visual if isinstance(visual, dict) else {}
+            if visual.get("login") is True:
+                raise ErrorSesionInstagram("login", "Instagram mostró el formulario de inicio de sesión.")
+            if visual.get("captcha") is True:
+                raise ErrorSesionInstagram("verificacion", "Instagram mostró una verificación/CAPTCHA manual.")
+            autenticado = visual.get("autenticado") is True
+            if not autenticado and visual.get("login_invitado") is True:
+                raise ErrorSesionInstagram("login", "Instagram mostró el perfil sin una sesión autenticada.")
+            titulos = visual.get("titulos", [])
+            titulo_correcto = any(str(t).strip().lstrip("@").casefold() == username for t in titulos)
+            labels = {str(b).strip().casefold() for b in visual.get("botones", [])} if titulo_correcto else set()
+            if labels & {"siguiendo", "following"}:
+                siguiendo = True
+            elif labels & {"solicitado", "requested", "seguir", "follow", "seguir también", "follow back"}:
+                siguiendo = False
+            lineas = {linea.strip().rstrip(".! ").casefold() for linea in str(visual.get("texto", "")).splitlines()}
+            aviso_privado = bool(lineas & {"esta cuenta es privada", "este perfil es privado",
+                                           "this account is private", "this profile is private"})
+            no_encontrado = bool(lineas & {"esta página no está disponible", "esta página no está disponible por el momento",
+                                           "sorry, this page isn't available", "page isn't available"})
+            if no_encontrado:
+                raise PerfilNoEncontrado(f"Instagram no encontró el perfil @{username}.")
+            if aviso_privado and titulo_correcto and autenticado:
+                if privado is False or siguiendo is True:
+                    raise ErrorConsultaInstagram("Instagram mostró señales contradictorias de acceso al perfil.")
+                recordar_estado_sano()
+                raise PerfilPrivado(f"La sesión autenticada no tiene acceso a @{username}.")
+            # El perfil debe estar montado y autenticado. Metadatos aislados o
+            # recomendaciones no prueban que su página se haya mostrado.
+            identidad = titulo_correcto and autenticado
+            publicaciones_visibles = titulo_correcto and visual.get("publicaciones") is True
+            if identidad and privado is True and siguiendo is False:
+                recordar_estado_sano()
+                raise PerfilPrivado(f"La sesión autenticada no tiene acceso a @{username}.")
+            if identidad and (siguiendo is True or privado is False or (privado is None and publicaciones_visibles)):
+                recordar_estado_sano()
+                return {"username": username, "user_id": uid, "is_private": privado,
+                        "following": siguiendo, "acceso_confirmado": True}
+            if time.monotonic() >= limite:
+                if observacion["errores"]:
+                    raise observacion["errores"][0]
+                raise ErrorConsultaInstagram(
+                    f"La página de @{username} no permitió confirmar el acceso: "
+                    "no mostró una cabecera autenticada con publicaciones, relación o privacidad explícitas."
+                )
+            page.wait_for_timeout(250)
+
+    def recordar_estado_sano():
+        # Sólo estado local del navegador. Si la siguiente página falla, se
+        # conserva este último estado correcto en lugar del interstitial final.
+        try:
+            recursos["ultimo_estado"] = recursos["context"].storage_state(indexed_db=True)
+        except TypeError:
+            recursos["ultimo_estado"] = recursos["context"].storage_state()
+
+    try:
+        yield verificar
+    finally:
+        try:
+            if recursos and recursos["ultimo_estado"] is not None:
+                # El actualizador ya salió de usar_sesion al cerrar el manager.
+                with usar_sesion(recursos["sesion"]):
+                    escribir_json_atomico(obtener_ruta_sesion(), recursos["ultimo_estado"])
+        finally:
+            stack.close()
+
+
+def _comprobar_perfil_desde_pagina(context, username: str, user_id: int, estados):
+    """Completa metadatos sin depender de Stories ni de publicaciones visibles."""
+    estados = list(estados)
+    errores_sesion = []
+    page = context.new_page()
+
+    def solicitud_terminada(request):
+        try:
+            response = request.response()
+            if response is None:
+                return
+            url = urlsplit(response.url)
+            if url.hostname not in ("instagram.com", "www.instagram.com", "i.instagram.com"):
+                return
+            if not any(ruta in url.path for ruta in ("/api/", "/graphql/")):
+                return
+            if int(response.status) == 429:
+                validar_respuesta_instagram(response, response, f"cargar el perfil de @{username}")
+            if "json" not in response.headers.get("content-type", "").lower():
+                return
+            data = response.json()
+            validar_datos_instagram(data)
+            estados.extend(_extraer_estado_perfil(data, username))
+        except ErrorSesionInstagram as error:
+            errores_sesion.append(error)
+        except Exception:
+            pass  # Recursos ajenos al perfil no determinan su acceso.
+
+    page.on("requestfinished", solicitud_terminada)
+    try:
+        response = page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded", timeout=60_000)
+        validar_respuesta_instagram(page, response, f"abrir @{username}")
+        page.wait_for_timeout(2_000)
+        validar_pagina_instagram(page)
+        # Primero aprovechar la página que ya se cargó. Un endpoint secundario
+        # no debe recibir otra petición si «Siguiendo» ya confirma el permiso.
+        for intento in range(4):
+            if errores_sesion:
+                raise errores_sesion[0]
+            estados.extend(_estados_en_html(page.content(), username))
+            privado, siguiendo = _resumir_estado_perfil(estados, username, user_id)
+            if privado is False or siguiendo is True or (privado is True and siguiendo is False):
+                return privado, siguiendo
+            if urlsplit(str(page.url)).path.rstrip("/").casefold() != "/" + username.casefold():
+                raise ErrorConsultaInstagram("Instagram abrió una página distinta del perfil solicitado.")
+            texto = page.locator("body").inner_text().casefold()
+            aviso_privado = any(linea.strip().rstrip(".! ") in ("esta cuenta es privada", "this account is private")
+                                for linea in texto.splitlines())
+            visual = page.evaluate("""() => {
+                const h = document.querySelector('main header');
+                if (!h) return {titulos: [], botones: []};
+                const visibles = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+                return {
+                    titulos: [...h.querySelectorAll('h1,h2')].filter(visibles).map(e => e.textContent.trim()),
+                    botones: [...h.querySelectorAll('button,[role="button"]')].filter(visibles)
+                        .map(e => (e.innerText || e.getAttribute('aria-label') || '').trim())
+                };
+            }""")
+            titulos = visual.get("titulos", []) if isinstance(visual, dict) else []
+            botones = visual.get("botones", []) if isinstance(visual, dict) else []
+            titulo_correcto = any(str(t).strip().lstrip("@").casefold() == username.casefold() for t in titulos)
+            if titulo_correcto:
+                labels = {str(b).strip().casefold() for b in botones}
+                if labels & {"siguiendo", "following"}:
+                    siguiendo = True
+                elif labels & {"solicitado", "requested", "seguir", "follow", "seguir también", "follow back"}:
+                    siguiendo = False
+            if aviso_privado:
+                if siguiendo is True:
+                    raise ErrorConsultaInstagram("Instagram mostró señales contradictorias de acceso al perfil.")
+                privado, siguiendo = True, False
+            if errores_sesion:
+                raise errores_sesion[0]
+            if siguiendo is True or (privado is True and siguiendo is False):
+                return privado, siguiendo
+            if intento < 3:
+                page.wait_for_timeout(1_000)
+                validar_pagina_instagram(page)
+
+        if errores_sesion:
+            raise errores_sesion[0]
+        # Sólo si la página sigue siendo indeterminada: una consulta alternativa.
+        response_api = None
+        try:
+            response_api = context.request.get(
+                "https://www.instagram.com/api/v1/users/web_profile_info/?" + urlencode({"username": username}),
+                headers={"x-ig-app-id": "936619743392459", "Referer": f"https://www.instagram.com/{username}/"},
+                timeout=30_000,
+            )
+            validar_respuesta_instagram(response_api, response_api, f"consultar el perfil de @{username}")
+            data = response_api.json()
+            validar_datos_instagram(data)
+            estados.extend(_extraer_estado_perfil(data, username))
+        except (ErrorConsultaInstagram, PerfilNoEncontrado, ValueError):
+            pass
+        finally:
+            if response_api is not None:
+                response_api.dispose()
+        if errores_sesion:
+            raise errores_sesion[0]
+        return _resumir_estado_perfil(estados, username, user_id)
+    finally:
+        page.close()
+
+
+@con_sesiones(verificar_todas=True)
+def comprobar_perfil_accesible(username: str, *, sin_historias: bool = False) -> dict[str, Any]:
     """
     Verifica realmente el acceso al perfil con la sesión Web autenticada.
 
     - Público: se permite.
     - Privado: sólo se permite si Instagram confirma following=True.
-    - Si Instagram no permite determinar la privacidad de forma fiable,
-      se aborta para no agregar un perfil inaccesible por error.
+    - Privacidad desconocida: seguir al perfil confirma acceso sin inventar su privacidad.
+    - La comprobación alternativa usa la página y sus datos autenticados, no Stories.
+    - sin_historias desactiva los campos de reels en la consulta de permisos;
+      solicita como máximo una publicación, sin descargar su archivo.
     """
     username = limpiar_username(username)
     comprobar_sesion_local()
@@ -572,43 +887,18 @@ def comprobar_perfil_accesible(username: str) -> dict[str, Any]:
     user_id = resolver_user_id(username)
 
     with _BLOQUEO:
-        with sync_playwright() as p:
+        with usar_playwright_sincronico(sync_playwright) as p:
             browser, context = _crear_contexto(p)
 
             try:
                 page = context.new_page()
                 response = page.goto(
-                    _construir_profile_info_url(username),
+                    _construir_profile_info_url(username, sin_historias=sin_historias),
                     wait_until="domcontentloaded",
                     timeout=60_000,
                 )
 
-                if response is None:
-                    raise RuntimeError(
-                        f"Instagram no devolvió respuesta al verificar @{username}."
-                    )
-
-                if response.status == 404:
-                    raise PerfilNoEncontrado(
-                        f"No se encontró @{username}."
-                    )
-
-                if response.status in (401, 403):
-                    raise RuntimeError(
-                        "Instagram rechazó la sesión al verificar el perfil "
-                        f"(HTTP {response.status})."
-                    )
-
-                if response.status == 429:
-                    raise RuntimeError(
-                        "Instagram respondió 429 / rate limit al verificar el perfil."
-                    )
-
-                if response.status >= 400:
-                    raise RuntimeError(
-                        f"Instagram respondió HTTP {response.status} "
-                        f"al verificar @{username}."
-                    )
+                validar_respuesta_instagram(page, response, f"verificar @{username}")
 
                 try:
                     data = response.json()
@@ -616,94 +906,39 @@ def comprobar_perfil_accesible(username: str) -> dict[str, Any]:
                     try:
                         data = json.loads(page.locator("body").inner_text())
                     except Exception as error:
-                        raise RuntimeError(
+                        raise ErrorConsultaInstagram(
                             "Instagram no devolvió JSON válido al verificar "
                             f"@{username}."
                         ) from error
 
+                validar_datos_instagram(data)
+
                 if not isinstance(data, dict):
-                    raise RuntimeError(
+                    raise ErrorConsultaInstagram(
                         f"Instagram devolvió una respuesta inválida para @{username}."
                     )
 
                 if data.get("errors"):
-                    raise RuntimeError(
+                    raise ErrorConsultaInstagram(
                         f"Instagram devolvió un error GraphQL para @{username}."
                     )
 
                 estados = _extraer_estado_perfil(data, username)
 
-                privados = [
-                    estado["is_private"]
-                    for estado in estados
-                    if estado.get("is_private") is not None
-                ]
-                seguimientos = [
-                    estado["following"]
-                    for estado in estados
-                    if estado.get("following") is not None
-                ]
-                ids = [
-                    int(estado["user_id"])
-                    for estado in estados
-                    if estado.get("user_id")
-                ]
+                es_privado, siguiendo = _resumir_estado_perfil(estados, username, user_id)
+                if (es_privado is None and siguiendo is not True) or (es_privado and siguiendo is None):
+                    es_privado, siguiendo = _comprobar_perfil_desde_pagina(context, username, user_id, estados)
 
-                if True in privados:
-                    es_privado: bool | None = True
-                elif False in privados:
-                    es_privado = False
-                else:
-                    es_privado = None
-
-                if True in seguimientos:
-                    siguiendo: bool | None = True
-                elif False in seguimientos:
-                    siguiendo = False
-                else:
-                    siguiendo = None
-
-                # Fallback visual conservador por si Instagram cambia la forma
-                # del JSON pero mantiene el aviso visible de perfil privado.
-                if es_privado is None:
-                    try:
-                        page_perfil = context.new_page()
-                        resp_perfil = page_perfil.goto(
-                            f"https://www.instagram.com/{username}/",
-                            wait_until="domcontentloaded",
-                            timeout=60_000,
-                        )
-                        if resp_perfil is not None and resp_perfil.status == 404:
-                            raise PerfilNoEncontrado(
-                                f"No se encontró @{username}."
-                            )
-                        page_perfil.wait_for_timeout(2_000)
-                        texto_pagina = page_perfil.locator("body").inner_text().casefold()
-                        if (
-                            "esta cuenta es privada" in texto_pagina
-                            or "this account is private" in texto_pagina
-                        ):
-                            es_privado = True
-                            if siguiendo is None:
-                                siguiendo = False
-                    except PerfilNoEncontrado:
-                        raise
-                    except Exception:
-                        pass
-
-                if es_privado is None:
-                    raise RuntimeError(
-                        "No pude confirmar si el perfil es público o privado. "
-                        "Por seguridad no fue agregado."
+                if es_privado is None and siguiendo is not True:
+                    raise ErrorConsultaInstagram(
+                        f"Instagram no permitió confirmar el acceso a @{username}: "
+                        "faltan datos de privacidad y no se confirmó que la sesión lo siga."
                     )
 
-                # Si el JSON trajo el ID, sólo lo usamos para comprobar que
-                # corresponde al mismo perfil resuelto por el motor existente.
-                if ids and int(user_id) not in ids:
-                    raise RuntimeError(
-                        f"Instagram devolvió un ID inconsistente para @{username}."
+                if es_privado and siguiendo is None:
+                    raise ErrorConsultaInstagram(
+                        f"El perfil @{username} es privado, pero Instagram no permitió confirmar si esta sesión lo sigue."
                     )
-
                 if es_privado and siguiendo is not True:
                     raise PerfilPrivado(
                         f"La sesión autenticada no tiene acceso a @{username}."
@@ -718,8 +953,9 @@ def comprobar_perfil_accesible(username: str) -> dict[str, Any]:
                 return {
                     "username": username,
                     "user_id": int(user_id),
-                    "is_private": bool(es_privado),
+                    "is_private": es_privado,
                     "following": siguiendo,
+                    "acceso_confirmado": True,
                 }
 
             finally:
@@ -874,6 +1110,7 @@ def _construir_url_stories(user_id: int) -> str:
     )
 
 
+@con_sesiones()
 def descargar_historias(
     username: str,
     user_id: int | None = None,
@@ -902,7 +1139,7 @@ def descargar_historias(
 
         url_graphql = _construir_url_stories(user_id)
 
-        with sync_playwright() as p:
+        with usar_playwright_sincronico(sync_playwright) as p:
             browser, context = _crear_contexto(p)
 
             try:
@@ -914,28 +1151,7 @@ def descargar_historias(
                     timeout=60_000,
                 )
 
-                if response is None:
-                    raise RuntimeError(
-                        f"Instagram no respondió al consultar Stories de @{username}."
-                    )
-
-                if response.status in (401, 403):
-                    raise RuntimeError(
-                        "Instagram rechazó la sesión web. "
-                        "Puede ser necesario exportar una sesión nueva."
-                    )
-
-                if response.status >= 400:
-                    raise RuntimeError(
-                        f"Instagram respondió HTTP {response.status} "
-                        f"al consultar Stories de @{username}."
-                    )
-
-                if "/accounts/login" in page.url.lower():
-                    raise RuntimeError(
-                        "Instagram redirigió al login. "
-                        "La sesión web ya no es válida."
-                    )
+                validar_respuesta_instagram(page, response, f"consultar Stories de @{username}")
 
                 try:
                     data = response.json()
@@ -944,19 +1160,22 @@ def descargar_historias(
                     try:
                         data = json.loads(texto)
                     except Exception as error:
-                        raise RuntimeError(
+                        raise ErrorConsultaInstagram(
                             "Instagram no devolvió JSON válido en Stories."
                         ) from error
 
+                validar_datos_instagram(data)
                 reels = _buscar_reels_media(data)
 
                 if reels is None:
-                    raise RuntimeError(
+                    raise ErrorConsultaInstagram(
                         "La respuesta de Instagram no contiene reels_media. "
                         "Es posible que Instagram haya cambiado el endpoint/query_hash."
                     )
 
                 if not reels:
+                    # Un privado inaccesible también puede responder con reels vacíos.
+                    comprobar_perfil_accesible(username)
                     raise SinHistoriasDisponibles(
                         f"@{username} no tiene historias visibles actualmente."
                     )
@@ -977,6 +1196,7 @@ def descargar_historias(
                         )
 
                 if not items:
+                    comprobar_perfil_accesible(username)
                     raise SinHistoriasDisponibles(
                         f"@{username} no tiene historias visibles actualmente."
                     )
@@ -1022,7 +1242,7 @@ def descargar_historias(
 
                     try:
                         if not respuesta_media.ok:
-                            raise RuntimeError(
+                            raise ErrorConsultaInstagram(
                                 f"CDN respondió HTTP {respuesta_media.status} "
                                 f"para Story {story_pk}."
                             )
