@@ -1,13 +1,16 @@
-# Bot Telegram StoryPulse v1.0
-# https://github.com/FacuSecX/
+# StoryPulse v2.0
+# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_FILE = BASE_DIR / "bot_historias.db"
@@ -19,14 +22,18 @@ _LOCK = threading.RLock()
 # CONEXIÓN / UTILIDADES
 # ============================================================
 
-def conectar() -> sqlite3.Connection:
+@contextmanager
+def conectar() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(
         DB_FILE,
         timeout=30,
     )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def ahora_iso() -> str:
@@ -80,6 +87,29 @@ def inicializar() -> None:
             """
         )
 
+        # Historias guardadas dentro de carruseles destacados. Se conserva el
+        # ID del carrusel y el ID de la Story para que una nueva sesión o un
+        # cambio de nombre del carrusel no vuelva a descargar el mismo item.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historias_destacadas_descargadas (
+                chat_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                highlight_id TEXT NOT NULL,
+                story_pk TEXT NOT NULL,
+                grupo TEXT NOT NULL DEFAULT '',
+                ruta TEXT NOT NULL DEFAULT '',
+                descargada_en TEXT NOT NULL,
+                PRIMARY KEY (
+                    chat_id,
+                    username,
+                    highlight_id,
+                    story_pk
+                )
+            )
+            """
+        )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS programaciones (
@@ -92,6 +122,9 @@ def inicializar() -> None:
                 tipo_programacion TEXT NOT NULL DEFAULT 'horarios',
                 intervalo_horas INTEGER,
                 intervalo_inicio TEXT,
+                modalidad_sesiones TEXT NOT NULL DEFAULT 'normal',
+                sesiones_rotacion_json TEXT NOT NULL DEFAULT '[]',
+                ultima_sesion_rotacion TEXT,
                 PRIMARY KEY (
                     chat_id,
                     username
@@ -151,6 +184,18 @@ def inicializar() -> None:
                 ADD COLUMN intervalo_inicio TEXT
                 """
             )
+
+        # La selección de sesiones es independiente de la cadencia. Las
+        # programaciones existentes conservan su comportamiento habitual.
+        for columna, definicion in (
+            ("modalidad_sesiones", "TEXT NOT NULL DEFAULT 'normal'"),
+            ("sesiones_rotacion_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("ultima_sesion_rotacion", "TEXT"),
+        ):
+            if columna not in columnas_programaciones:
+                conn.execute(
+                    f"ALTER TABLE programaciones ADD COLUMN {columna} {definicion}"
+                )
 
         # ----------------------------------------------------
         # Publicaciones descargadas / antirepetición
@@ -276,6 +321,16 @@ def inicializar() -> None:
 
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_historias_destacadas_usuario
+            ON historias_destacadas_descargadas (
+                chat_id,
+                username
+            )
+            """
+        )
+
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_programaciones_chat
             ON programaciones (
                 chat_id
@@ -382,6 +437,152 @@ def registrar_historia(
             ),
         )
         conn.commit()
+
+
+def destacada_ya_descargada(
+    chat_id: int,
+    username: str,
+    highlight_id: str,
+    story_pk: str,
+) -> bool:
+    """Indica si una Story de un carrusel ya fue archivada."""
+    with _LOCK, conectar() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM historias_destacadas_descargadas
+            WHERE chat_id = ?
+              AND username = ?
+              AND highlight_id = ?
+              AND story_pk = ?
+            LIMIT 1
+            """,
+            (
+                int(chat_id),
+                str(username).lower(),
+                str(highlight_id),
+                str(story_pk),
+            ),
+        ).fetchone()
+    return row is not None
+
+
+def obtener_destacada(
+    chat_id: int,
+    username: str,
+    highlight_id: str,
+    story_pk: str,
+) -> dict[str, str] | None:
+    """Devuelve el registro completo para poder migrar rutas antiguas."""
+    with _LOCK, conectar() as conn:
+        row = conn.execute(
+            """
+            SELECT grupo, ruta
+            FROM historias_destacadas_descargadas
+            WHERE chat_id = ?
+              AND username = ?
+              AND highlight_id = ?
+              AND story_pk = ?
+            LIMIT 1
+            """,
+            (
+                int(chat_id),
+                str(username).lower(),
+                str(highlight_id),
+                str(story_pk),
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"grupo": str(row["grupo"] or ""), "ruta": str(row["ruta"] or "")}
+
+
+def actualizar_ruta_destacada(
+    chat_id: int,
+    username: str,
+    highlight_id: str,
+    story_pk: str,
+    *,
+    grupo: str,
+    ruta: str,
+) -> None:
+    """Actualiza la carpeta/nombre conservando el ID antirepetición."""
+    with _LOCK, conectar() as conn:
+        conn.execute(
+            """
+            UPDATE historias_destacadas_descargadas
+            SET grupo = ?, ruta = ?
+            WHERE chat_id = ?
+              AND username = ?
+              AND highlight_id = ?
+              AND story_pk = ?
+            """,
+            (
+                str(grupo),
+                str(ruta),
+                int(chat_id),
+                str(username).lower(),
+                str(highlight_id),
+                str(story_pk),
+            ),
+        )
+        conn.commit()
+
+
+def registrar_destacada(
+    chat_id: int,
+    username: str,
+    highlight_id: str,
+    story_pk: str,
+    *,
+    grupo: str = "",
+    ruta: str = "",
+) -> None:
+    """Registra una Story de Highlights de forma idempotente."""
+    with _LOCK, conectar() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO historias_destacadas_descargadas
+            (
+                chat_id,
+                username,
+                highlight_id,
+                story_pk,
+                grupo,
+                ruta,
+                descargada_en
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(chat_id),
+                str(username).lower(),
+                str(highlight_id),
+                str(story_pk),
+                str(grupo),
+                str(ruta),
+                ahora_iso(),
+            ),
+        )
+        conn.commit()
+
+
+def ids_destacadas_descargadas(
+    chat_id: int,
+    username: str,
+) -> set[tuple[str, str]]:
+    """Devuelve (ID del carrusel, ID de Story) ya archivados."""
+    with _LOCK, conectar() as conn:
+        rows = conn.execute(
+            """
+            SELECT highlight_id, story_pk
+            FROM historias_destacadas_descargadas
+            WHERE chat_id = ?
+              AND username = ?
+            """,
+            (int(chat_id), str(username).lower()),
+        ).fetchall()
+    return {(str(row["highlight_id"]), str(row["story_pk"])) for row in rows}
 
 
 # ============================================================
@@ -533,75 +734,52 @@ def marcar_publicaciones_historial_completo(
 def limpiar_antirepeticion_perfil(
     chat_id: int,
     username: str,
+    tipo: str = "todo",
 ) -> dict[str, int]:
     """
-    Elimina SOLO el historial antirepetición de un perfil concreto.
+    Elimina los IDs del tipo elegido para un perfil y chat concretos.
 
     No elimina la cuenta, programaciones, archivos, sesión ni registros de
-    Telegram. También borra el estado de backfill para que la próxima descarga
-    de publicaciones vuelva a recorrer el perfil completo.
+    Telegram. Al resetear publicaciones (o todo), también borra su estado de
+    backfill para recorrer de nuevo el historial de publicaciones.
     """
+    tablas = {
+        "historias": "historias_enviadas",
+        "publicaciones": "publicaciones_descargadas",
+        "destacadas": "historias_destacadas_descargadas",
+    }
+    if tipo not in {"todo", *tablas}:
+        raise ValueError("Tipo de antirepetición inválido.")
+
     chat_id = int(chat_id)
     username = str(username).lower()
+    eliminados = dict.fromkeys(tablas, 0)
 
     with _LOCK, conectar() as conn:
-        historias = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) AS total
-                FROM historias_enviadas
-                WHERE chat_id = ?
-                  AND username = ?
-                """,
+        for nombre, tabla in tablas.items():
+            if tipo not in {"todo", nombre}:
+                continue
+            # Los nombres de tabla provienen exclusivamente del mapa fijo.
+            eliminados[nombre] = int(conn.execute(
+                f"SELECT COUNT(*) AS total FROM {tabla} "
+                "WHERE chat_id = ? AND username = ?",
                 (chat_id, username),
-            ).fetchone()["total"]
-        )
-
-        publicaciones = int(
+            ).fetchone()["total"])
             conn.execute(
-                """
-                SELECT COUNT(*) AS total
-                FROM publicaciones_descargadas
-                WHERE chat_id = ?
-                  AND username = ?
-                """,
+                f"DELETE FROM {tabla} WHERE chat_id = ? AND username = ?",
                 (chat_id, username),
-            ).fetchone()["total"]
-        )
+            )
 
-        conn.execute(
-            """
-            DELETE FROM historias_enviadas
-            WHERE chat_id = ?
-              AND username = ?
-            """,
-            (chat_id, username),
-        )
-
-        conn.execute(
-            """
-            DELETE FROM publicaciones_descargadas
-            WHERE chat_id = ?
-              AND username = ?
-            """,
-            (chat_id, username),
-        )
-
-        conn.execute(
-            """
-            DELETE FROM publicaciones_sync_perfil
-            WHERE chat_id = ?
-              AND username = ?
-            """,
-            (chat_id, username),
-        )
+        if tipo in {"todo", "publicaciones"}:
+            conn.execute(
+                "DELETE FROM publicaciones_sync_perfil "
+                "WHERE chat_id = ? AND username = ?",
+                (chat_id, username),
+            )
 
         conn.commit()
 
-    return {
-        "historias": historias,
-        "publicaciones": publicaciones,
-    }
+    return eliminados
 
 
 # ============================================================
@@ -612,6 +790,9 @@ def guardar_programacion(
     chat_id: int,
     username: str,
     horarios: list[str],
+    *,
+    modalidad_sesiones: str = "normal",
+    sesiones_rotacion: list[str] | None = None,
 ) -> None:
     """
     Guarda la modalidad clásica de horarios fijos por día.
@@ -628,6 +809,9 @@ def guardar_programacion(
             if str(hora).strip()
         }
     )
+    modalidad_sesiones, sesiones = _validar_modalidad_sesiones(
+        modalidad_sesiones, sesiones_rotacion
+    )
 
     with _LOCK, conectar() as conn:
         conn.execute(
@@ -642,9 +826,12 @@ def guardar_programacion(
                 notificacion_activada,
                 tipo_programacion,
                 intervalo_horas,
-                intervalo_inicio
+                intervalo_inicio,
+                modalidad_sesiones,
+                sesiones_rotacion_json,
+                ultima_sesion_rotacion
             )
-            VALUES (?, ?, ?, 1, ?, 1, 'horarios', NULL, NULL)
+            VALUES (?, ?, ?, 1, ?, 1, 'horarios', NULL, NULL, ?, ?, NULL)
 
             ON CONFLICT(
                 chat_id,
@@ -655,7 +842,10 @@ def guardar_programacion(
                 activa = 1,
                 tipo_programacion = 'horarios',
                 intervalo_horas = NULL,
-                intervalo_inicio = NULL
+                intervalo_inicio = NULL,
+                modalidad_sesiones = excluded.modalidad_sesiones,
+                sesiones_rotacion_json = excluded.sesiones_rotacion_json,
+                ultima_sesion_rotacion = NULL
             """,
             (
                 int(chat_id),
@@ -665,6 +855,8 @@ def guardar_programacion(
                     ensure_ascii=False,
                 ),
                 ahora_iso(),
+                modalidad_sesiones,
+                json.dumps(sesiones, ensure_ascii=False),
             ),
         )
         conn.commit()
@@ -676,6 +868,8 @@ def guardar_programacion_intervalo(
     intervalo_horas: int,
     *,
     inicio_iso: str | None = None,
+    modalidad_sesiones: str = "normal",
+    sesiones_rotacion: list[str] | None = None,
 ) -> None:
     """
     Guarda una programación cada N horas.
@@ -706,6 +900,9 @@ def guardar_programacion_intervalo(
     inicio_normalizado = inicio.astimezone(
         timezone.utc
     ).isoformat()
+    modalidad_sesiones, sesiones = _validar_modalidad_sesiones(
+        modalidad_sesiones, sesiones_rotacion
+    )
 
     with _LOCK, conectar() as conn:
         conn.execute(
@@ -720,9 +917,12 @@ def guardar_programacion_intervalo(
                 notificacion_activada,
                 tipo_programacion,
                 intervalo_horas,
-                intervalo_inicio
+                intervalo_inicio,
+                modalidad_sesiones,
+                sesiones_rotacion_json,
+                ultima_sesion_rotacion
             )
-            VALUES (?, ?, '[]', 1, ?, 1, 'intervalo', ?, ?)
+            VALUES (?, ?, '[]', 1, ?, 1, 'intervalo', ?, ?, ?, ?, NULL)
 
             ON CONFLICT(
                 chat_id,
@@ -733,7 +933,10 @@ def guardar_programacion_intervalo(
                 activa = 1,
                 tipo_programacion = 'intervalo',
                 intervalo_horas = excluded.intervalo_horas,
-                intervalo_inicio = excluded.intervalo_inicio
+                intervalo_inicio = excluded.intervalo_inicio,
+                modalidad_sesiones = excluded.modalidad_sesiones,
+                sesiones_rotacion_json = excluded.sesiones_rotacion_json,
+                ultima_sesion_rotacion = NULL
             """,
             (
                 int(chat_id),
@@ -741,9 +944,99 @@ def guardar_programacion_intervalo(
                 ahora_iso(),
                 intervalo_horas,
                 inicio_normalizado,
+                modalidad_sesiones,
+                json.dumps(sesiones, ensure_ascii=False),
             ),
         )
         conn.commit()
+
+
+def _normalizar_sesiones_rotacion(sesiones) -> list[str]:
+    if not isinstance(sesiones, (list, tuple)):
+        raise ValueError("sesiones_rotacion debe ser una lista de sesiones")
+    resultado = []
+    for sesion_id in sesiones:
+        if not isinstance(sesion_id, str):
+            raise ValueError("La rotación contiene un identificador de sesión inválido")
+        sesion_id = sesion_id.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", sesion_id):
+            raise ValueError("La rotación contiene un identificador de sesión inválido")
+        if sesion_id not in resultado:
+            resultado.append(sesion_id)
+    return resultado
+
+
+def _validar_modalidad_sesiones(modalidad, sesiones) -> tuple[str, list[str]]:
+    if not isinstance(modalidad, str) or modalidad not in {"normal", "variable"}:
+        raise ValueError("modalidad_sesiones debe ser 'normal' o 'variable'")
+    if modalidad == "normal":
+        return modalidad, []
+    sesiones = _normalizar_sesiones_rotacion(sesiones)
+    if not sesiones:
+        raise ValueError("Una programación variable necesita al menos una sesión con acceso")
+    return modalidad, sesiones
+
+
+def modalidad_sesiones_de(row) -> str:
+    """Una fila de una versión anterior sigue usando su sesión preferida."""
+    try:
+        valor = row["modalidad_sesiones"]
+    except (KeyError, IndexError, TypeError):
+        return "normal"
+    return "variable" if valor == "variable" else "normal"
+
+
+def sesiones_rotacion_de(row) -> list[str]:
+    """Lee sólo el conjunto validado de esta programación, sin otras sesiones."""
+    if modalidad_sesiones_de(row) != "variable":
+        return []
+    try:
+        return _normalizar_sesiones_rotacion(json.loads(row["sesiones_rotacion_json"]))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return []
+
+
+def preparar_rotacion(chat_id: int, username: str) -> list[str]:
+    """Ordena el próximo intento después de la última sesión realmente usada.
+
+    Leer el orden no lo avanza. El ejecutor confirma la sesión al terminar
+    cada revisión; así un fallback también determina el siguiente turno.
+    """
+    with _LOCK, conectar() as conn:
+        row = conn.execute(
+            "SELECT * FROM programaciones WHERE chat_id = ? AND username = ?",
+            (int(chat_id), str(username).lower()),
+        ).fetchone()
+        sesiones = sesiones_rotacion_de(row)
+        if not sesiones:
+            return []
+        ultima = row["ultima_sesion_rotacion"]
+        if ultima not in sesiones:
+            return sesiones
+        siguiente = sesiones.index(ultima) + 1
+        return sesiones[siguiente:] + sesiones[:siguiente]
+
+
+def registrar_sesion_rotacion(chat_id: int, username: str, sesion_id: str) -> bool:
+    """Avanza sólo esta programación y sólo dentro de su conjunto autorizado."""
+    if not isinstance(sesion_id, str):
+        return False
+    sesion_id = sesion_id.strip().lower()
+    with _LOCK, conectar() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM programaciones WHERE chat_id = ? AND username = ?",
+            (int(chat_id), str(username).lower()),
+        ).fetchone()
+        if sesion_id not in sesiones_rotacion_de(row):
+            return False
+        conn.execute(
+            """UPDATE programaciones SET ultima_sesion_rotacion = ?
+               WHERE chat_id = ? AND username = ?""",
+            (sesion_id, int(chat_id), str(username).lower()),
+        )
+        conn.commit()
+        return True
 
 
 def tipo_programacion(row) -> str:
