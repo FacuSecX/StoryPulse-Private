@@ -1,7 +1,7 @@
 # StoryPulse Private v2.1
 
 <p align="center">
-<img src="http://imgfz.com/i/QnmALpy.png" title="StoryPulse">
+<img src="http://imgfz.com/i/DsjXu86.png" title="StoryPulse">
 </p>
 <br></br>
 
