@@ -1,8 +1,6 @@
 # StoryPulse v2.0
 # Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
-
-
 from __future__ import annotations
 
 import asyncio
@@ -28,7 +26,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -73,7 +71,10 @@ HISTORYS_DIR = Path(
     os.getenv("HISTORYS_DIR", "/historys")
 ).expanduser()
 
-PANEL_URL = os.getenv("STORYPULSE_PANEL_URL", "").strip()
+PANEL_URL = os.getenv(
+    "STORYPULSE_PANEL_URL",
+    "https://example.com/",
+).strip()
 TZ = ZoneInfo(
     os.getenv(
         "STORYPULSE_TIMEZONE",
@@ -93,6 +94,8 @@ CUENTAS_FILE = BASE_DIR / "cuentas.json"
 CUENTAS_LOCK = threading.RLock()
 IG_LOCK = asyncio.Lock()
 STORY_PROCESS_LOCK = asyncio.Lock()
+DESTACADAS_REVIEW_LOCK = asyncio.Lock()
+LIMPIEZAS_CHAT_EN_CURSO: set[int] = set()
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -104,6 +107,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 STATE = "state"
 ADD_NAME = "add_name"
 ADD_USERNAME = "add_username"
+GROUP_NAME = "group_name"
+GROUP_MEMBERS = "group_members"
+GROUP_DRAFT = "group_draft"
+GROUPS_PAGE_SIZE = 10
+GROUP_MEMBERS_PAGE_SIZE = 20
 SCHED_USERNAME = "sched_username"
 SCHED_COUNT = "sched_count"
 SCHED_TIMES = "sched_times"
@@ -570,6 +578,110 @@ def registrar_texto_entrante(
         )
 
 
+async def borrar_textos_chat(
+    cliente,
+    chat_id: int,
+    candidatos: list[int],
+) -> dict[str, int | bool]:
+    """Borra sólo textos conocidos; un error de red nunca divide un lote."""
+    resultado = {"procesados": 0, "no_borrables": 0, "pendientes": 0, "interrumpida": False}
+
+    async def solicitar(lote: list[int]) -> None:
+        for intento in range(3):
+            try:
+                confirmado = await cliente.delete_messages(chat_id=chat_id, message_ids=lote)
+                if not confirmado:
+                    raise TelegramError("Telegram no confirmó el borrado del lote.")
+                return
+            except RetryAfter as error:
+                if intento == 2:
+                    raise
+                espera = error.retry_after
+                segundos = espera.total_seconds() if isinstance(espera, timedelta) else float(espera)
+                await asyncio.sleep(max(0, segundos) + 0.1)
+            except BadRequest:
+                raise
+            except NetworkError:
+                if intento == 2:
+                    raise
+                await asyncio.sleep(intento + 1)
+
+    async def procesar(lote: list[int]) -> None:
+        try:
+            await solicitar(lote)
+        except BadRequest as error:
+            detalle = str(error).lower()
+            if "message to delete not found" in detalle or "message not found" in detalle:
+                # Ya estaban borrados: no deben volver a intentarse.
+                pass
+            elif any(texto in detalle for texto in (
+                "message can't be deleted", "message cannot be deleted", "48 hours",
+            )):
+                if len(lote) > 1:
+                    medio = len(lote) // 2
+                    await procesar(lote[:medio])
+                    await procesar(lote[medio:])
+                else:
+                    resultado["no_borrables"] += 1
+                return
+            else:
+                raise
+        resultado["procesados"] += len(lote)
+        await asyncio.to_thread(db.eliminar_registros_chat_limpiables, chat_id, lote)
+
+    try:
+        for inicio in range(0, len(candidatos), 100):
+            await procesar(candidatos[inicio:inicio + 100])
+    except TelegramError as error:
+        # Conservar los registros pendientes para poder reintentar después.
+        resultado["interrumpida"] = True
+        logger.warning("LIMPIAR CHAT: se interrumpió el borrado chat_id=%s: %s", chat_id, error)
+
+    resultado["pendientes"] = len(candidatos) - resultado["procesados"] - resultado["no_borrables"]
+    return resultado
+
+
+async def limpiar_chat_en_segundo_plano(
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    chat_id: int,
+    max_message_id: int,
+) -> None:
+    inicio = time.monotonic()
+    try:
+        protegidos = await asyncio.to_thread(db.ids_multimedia_protegida_chat, chat_id)
+        recientes = await asyncio.to_thread(db.mensajes_chat_limpiables_recientes, chat_id, horas=48)
+        candidatos = sorted({
+            int(message_id) for message_id in recientes
+            if 0 < int(message_id) < max_message_id and int(message_id) not in protegidos
+        }, reverse=True)
+        resultado = await borrar_textos_chat(context.bot, chat_id, candidatos)
+        await asyncio.to_thread(db.purgar_registros_chat_limpiables_vencidos, chat_id, horas=48)
+        titulo = "Limpieza parcial" if resultado["interrumpida"] else "Chat limpiado"
+        texto = (
+            f"🧹 <b>{titulo}</b>\n\n"
+            f"✅ Textos procesados: <b>{resultado['procesados']}</b>\n"
+            f"📸 Multimedia protegida: <b>{len(protegidos)}</b>\n"
+            f"⏱ Tiempo: <b>{time.monotonic() - inicio:.1f} s</b>"
+        )
+        if resultado["no_borrables"]:
+            texto += f"\nℹ️ Telegram no permite borrar {resultado['no_borrables']} mensaje(s)."
+        if resultado["pendientes"]:
+            texto += f"\n⚠️ Quedaron {resultado['pendientes']} texto(s) pendientes. Podés reintentar la limpieza."
+        texto += "\n\n📸 Las fotos y los videos quedaron intactos."
+        try:
+            await query.edit_message_text(
+                texto, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Menú principal", callback_data="menu")]]),
+            )
+        except TelegramError:
+            await enviar_texto_bot(context, chat_id=chat_id, text=texto, parse_mode="HTML", disable_notification=True)
+        logger.info("LIMPIAR CHAT: chat_id=%s candidatos=%s resultado=%s duración=%.2fs",
+                    chat_id, len(candidatos), resultado, time.monotonic() - inicio)
+    finally:
+        LIMPIEZAS_CHAT_EN_CURSO.discard(chat_id)
+
+
 def diagnosticar_error(error: Exception) -> tuple[str, str, str]:
     """
     Devuelve:
@@ -934,6 +1046,87 @@ def menu_cuentas_destacadas() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(filas)
 
 
+def menu_grupos(pagina: int = 0, *, eliminar: bool = False, modificar: bool = False) -> InlineKeyboardMarkup:
+    grupos = sorted(db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID),
+                    key=lambda g: (clave_orden_alfabetico(g["nombre"]), g["id"]))
+    paginas = max(1, (len(grupos) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    pagina = max(0, min(int(pagina), paginas - 1))
+    cuentas = cargar_cuentas()
+    actuales = {c["username"] for c in cuentas}
+    favoritas = len({c["username"] for c in cuentas if c.get("destacada") is True})
+    filas = [] if eliminar or modificar else [[InlineKeyboardButton(f"⭐ Cuentas Favoritas ({favoritas})", callback_data="review_featured")]]
+    for grupo in grupos[pagina * GROUPS_PAGE_SIZE:(pagina + 1) * GROUPS_PAGE_SIZE]:
+        cantidad = len(actuales.intersection(grupo["usuarios"]))
+        accion = "group_delete" if eliminar else "group_edit" if modificar else "group_review"
+        filas.append([InlineKeyboardButton(
+            f"{'🗑' if eliminar else '✏️' if modificar else '👥'} {grupo['nombre']} ({cantidad})",
+            callback_data=f"{accion}:{grupo['id']}",
+        )])
+    prefijo = "groups_delete_page" if eliminar else "groups_edit_page" if modificar else "groups_page"
+    navegacion = []
+    if pagina:
+        navegacion.append(InlineKeyboardButton("‹ Anterior", callback_data=f"{prefijo}:{pagina - 1}"))
+    if pagina + 1 < paginas:
+        navegacion.append(InlineKeyboardButton("Siguiente ›", callback_data=f"{prefijo}:{pagina + 1}"))
+    if navegacion:
+        filas.append(navegacion)
+    if eliminar or modificar:
+        filas.append([InlineKeyboardButton("‹ Revisar Grupos", callback_data="groups_menu")])
+    else:
+        filas.append([InlineKeyboardButton("➕ Crear grupo", callback_data="group_create")])
+        filas.append([InlineKeyboardButton("🗑 Eliminar grupo", callback_data="groups_delete")])
+        filas.append([InlineKeyboardButton("✏️ Modificar grupo", callback_data="groups_edit")])
+        filas.append([InlineKeyboardButton("‹ Menú principal", callback_data="menu")])
+    return InlineKeyboardMarkup(filas)
+
+
+def preparar_seleccion_grupo(borrador: dict) -> list[dict]:
+    cuentas = list({c["username"]: c for c in cargar_cuentas()}.values())
+    actuales = {c["username"] for c in cuentas}
+    borrador["usuarios"] = set(borrador.get("usuarios", ())).intersection(actuales)
+    paginas = max(1, (len(cuentas) + GROUP_MEMBERS_PAGE_SIZE - 1) // GROUP_MEMBERS_PAGE_SIZE)
+    borrador["pagina"] = max(0, min(int(borrador.get("pagina", 0)), paginas - 1))
+    return cuentas
+
+
+def texto_seleccion_grupo(borrador: dict) -> str:
+    accion = "Guardar cambios" if borrador.get("grupo_id") is not None else "Crear grupo"
+    return (f"👥 <b>{esc(borrador['nombre'])}</b>\n\n"
+            "Tocá los perfiles para añadirlos o quitarlos de este grupo.\n"
+            f"Seleccionados: <b>{len(borrador['usuarios'])}</b>\n\n"
+            f"Cuando termines, tocá {accion}.")
+
+
+def menu_seleccion_grupo(borrador: dict) -> InlineKeyboardMarkup:
+    cuentas = preparar_seleccion_grupo(borrador)
+    pagina, token = borrador["pagina"], borrador["token"]
+    elegidas = borrador["usuarios"]
+    botones = [boton_cuenta(c, f"{'✅' if c['username'] in elegidas else '▫️'} {c['nombre']} (@{c['username']})",
+                           f"group_pick:{token}:{c['username']}")
+               for c in cuentas[pagina * GROUP_MEMBERS_PAGE_SIZE:(pagina + 1) * GROUP_MEMBERS_PAGE_SIZE]]
+    filas = [botones[i:i + 2] for i in range(0, len(botones), 2)]
+    navegacion = []
+    if pagina:
+        navegacion.append(InlineKeyboardButton("‹ Anterior", callback_data=f"group_page:{token}:{pagina - 1}"))
+    if (pagina + 1) * GROUP_MEMBERS_PAGE_SIZE < len(cuentas):
+        navegacion.append(InlineKeyboardButton("Siguiente ›", callback_data=f"group_page:{token}:{pagina + 1}"))
+    if navegacion:
+        filas.append(navegacion)
+    accion = "Guardar cambios" if borrador.get("grupo_id") is not None else "Crear grupo"
+    filas.append([InlineKeyboardButton(f"✅ {accion} ({len(elegidas)})", callback_data=f"group_save:{token}", style="success")])
+    filas.append([InlineKeyboardButton("Cancelar", callback_data="groups_menu")])
+    return InlineKeyboardMarkup(filas)
+
+
+async def mostrar_seleccion_grupo(query, borrador: dict) -> None:
+    teclado = menu_seleccion_grupo(borrador)
+    try:
+        await query.edit_message_text(texto_seleccion_grupo(borrador), parse_mode="HTML", reply_markup=teclado)
+    except TelegramError as error:
+        if "not modified" not in str(error).lower():
+            raise
+
+
 def menu_perfiles_sesion_preferida() -> InlineKeyboardMarkup:
     botones = [boton_cuenta(c, f"👤 {c['nombre']} (@{c['username']})",
                             f"pref_profile:{c['username']}") for c in cargar_cuentas()]
@@ -1002,6 +1195,12 @@ def menu_principal() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
+                "👥 REVISAR GRUPOS",
+                callback_data="groups_menu",
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "📥 DESCARGAR PUBLICACIONES",
                 callback_data="publications_menu",
                 style="success",
@@ -1011,7 +1210,7 @@ def menu_principal() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 "✨ HISTORIAS DESTACADAS",
                 callback_data="highlights_menu",
-                style="success",
+                style="danger",
             )
         ],
         [
@@ -1080,7 +1279,7 @@ def menu_revisar_historias() -> InlineKeyboardMarkup:
         botones.append(
             boton_cuenta(
                 cuenta,
-                f"👤 {cuenta['nombre']}",
+                f"{'⭐' if cuenta.get('destacada') is True else '👤'} {cuenta['nombre']}",
                 callback_data=f"review:{cuenta['username']}",
             )
         )
@@ -2414,6 +2613,136 @@ async def revisar_usuario(
         return procesadas
 
 
+async def revisar_cuentas_grupo(
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    grupo_id: int | None = None,
+) -> None:
+    """Revisar favoritas o un grupo con el mismo flujo manual de cada perfil."""
+    if DESTACADAS_REVIEW_LOCK.locked():
+        await enviar_texto_bot(
+            context,
+            chat_id=AUTHORIZED_CHAT_ID,
+            text="ℹ️ Ya hay una revisión de grupo en curso.",
+            disable_notification=True,
+        )
+        return
+
+    async with DESTACADAS_REVIEW_LOCK:
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id) if grupo_id is not None else None
+        if grupo_id is not None and grupo is None:
+            await query.edit_message_text("Ese grupo ya no existe.", reply_markup=menu_grupos())
+            return
+        titulo = grupo["nombre"] if grupo is not None else "favoritas"
+        miembros = set(grupo["usuarios"]) if grupo is not None else None
+        # Una marca representa un perfil, aunque un archivo antiguo lo repita.
+        cuentas = {}
+        for cuenta in cargar_cuentas():
+            if (cuenta["username"] in miembros if miembros is not None else cuenta.get("destacada") is True):
+                cuentas.setdefault(cuenta["username"], cuenta)
+        if miembros is not None:
+            for username in sorted(miembros - cuentas.keys()):
+                cuentas[username] = None
+        if not cuentas:
+            await query.edit_message_text(
+                ("ℹ️ No hay cuentas marcadas como favoritas.\n\n"
+                 "Podés marcarlas desde Gestionar cuentas → Destacar cuentas.") if grupo is None
+                else f"ℹ️ {titulo} no tiene perfiles para revisar.",
+                reply_markup=menu_grupos(),
+            )
+            return
+
+        total = len(cuentas)
+        procesadas = sin_novedades = fallidas = omitidas = historias = 0
+
+        async def mostrar_avance(texto: str, *, final: bool = False) -> None:
+            opciones = {"reply_markup": menu_grupos()} if final else {}
+            try:
+                await query.edit_message_text(texto, **opciones)
+            except TelegramError as error:
+                if "not modified" in str(error).lower():
+                    return
+                logger.warning("No se pudo mostrar el avance del grupo: %s", error)
+                if final:
+                    await enviar_texto_bot(
+                        context,
+                        chat_id=AUTHORIZED_CHAT_ID,
+                        text=texto,
+                        disable_notification=True,
+                        **opciones,
+                    )
+
+        def texto_avance(encabezado: str) -> str:
+            return (
+                f"{encabezado}\n\n"
+                f"👤 Perfiles revisados: {procesadas}/{total}\n"
+                f"📥 Historias nuevas procesadas: {historias}\n"
+                f"ℹ️ Sin historias nuevas: {sin_novedades}\n"
+                f"⚠️ Perfiles con error: {fallidas}\n"
+                f"↪️ Omitidos: {omitidas}\n"
+                f"📋 Pendientes: {total - procesadas - omitidas}"
+            )
+
+        for username in cuentas:
+            actual = buscar_cuenta(username)
+            vigente = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id) if grupo_id is not None else None
+            pertenece = (vigente is not None and username in vigente["usuarios"]) if grupo_id is not None else (
+                actual is not None and actual.get("destacada") is True
+            )
+            if actual is None or not pertenece:
+                omitidas += 1
+                continue
+            await mostrar_avance(texto_avance(f"⏳ Revisando {titulo}: @{username}"))
+
+            # Reutilizar la revisión individual conserva la selección de sesión,
+            # sus respaldos, el guardado, el envío y la antirrepetición global.
+            tarea_revision = asyncio.create_task(revisar_usuario(
+                context, AUTHORIZED_CHAT_ID, username, manual=True,
+            ))
+            try:
+                cantidad = await asyncio.shield(tarea_revision)
+            except asyncio.CancelledError:
+                # Un hilo de Playwright no se detiene al cancelar un callback.
+                # Esperar el perfil actual antes de liberar el lote evita solapes;
+                # los siguientes perfiles ya no se ejecutan.
+                while not tarea_revision.done():
+                    try:
+                        await asyncio.shield(tarea_revision)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not tarea_revision.cancelled() and tarea_revision.exception():
+                    logger.warning("La revisión cancelada terminó con un error: %s",
+                                   tarea_revision.exception())
+                raise
+            except SinHistoriasDisponibles:
+                sin_novedades += 1
+            except Exception as error:
+                fallidas += 1
+                logger.exception("Error revisando @%s en %s", username, titulo)
+                try:
+                    await avisar_error_chat(
+                        context, AUTHORIZED_CHAT_ID, username, error, automatico=False,
+                    )
+                except TelegramError:
+                    logger.exception("No se pudo informar el error de @%s", username)
+            else:
+                historias += cantidad
+                if cantidad == 0:
+                    sin_novedades += 1
+            procesadas += 1
+
+        await mostrar_avance(
+            texto_avance(f"✅ Revisión de {titulo} completada"), final=True,
+        )
+
+
+async def revisar_cuentas_destacadas(context: ContextTypes.DEFAULT_TYPE, query) -> None:
+    # Mantener el callback anterior para los botones de favoritas ya enviados.
+    await revisar_cuentas_grupo(context, query)
+
+
 async def ejecucion_programada(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -2476,6 +2805,125 @@ async def start(
     )
 
 
+async def callback_grupos(context: ContextTypes.DEFAULT_TYPE, query, data: str) -> bool:
+    if data in ("groups_menu", "groups_delete", "groups_edit") or data.startswith(("groups_page:", "groups_delete_page:", "groups_edit_page:")):
+        context.user_data.clear()
+        eliminar = data == "groups_delete" or data.startswith("groups_delete_page:")
+        modificar = data == "groups_edit" or data.startswith("groups_edit_page:")
+        try:
+            pagina = int(data.split(":", 1)[1]) if ":" in data else 0
+        except ValueError:
+            pagina = 0
+        if eliminar:
+            texto = ("🗑 <b>Eliminar grupo</b>\n\nElegí el grupo que querés eliminar."
+                     if db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID) else "ℹ️ No hay grupos creados para eliminar.")
+        elif modificar:
+            texto = ("✏️ <b>Modificar grupo</b>\n\nElegí un grupo para añadir o quitar perfiles."
+                     if db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID) else "ℹ️ No hay grupos creados para modificar.")
+        else:
+            texto = "👥 <b>Revisar Grupos</b>\n\nElegí favoritas o uno de tus grupos para revisar sus historias."
+        await query.edit_message_text(texto, parse_mode="HTML", reply_markup=menu_grupos(pagina, eliminar=eliminar, modificar=modificar))
+        return True
+
+    if data == "group_create":
+        context.user_data.clear()
+        if not cargar_cuentas():
+            await query.edit_message_text("Primero agregá perfiles desde Gestionar cuentas.", reply_markup=menu_grupos())
+            return True
+        context.user_data[STATE] = GROUP_NAME
+        await query.edit_message_text(
+            "➕ Crear grupo\n\nEscribí el nombre del grupo.\nEjemplos: Grupo Colegio, Grupo trabajo.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="groups_menu")]]),
+        )
+        return True
+
+    if data.startswith(("group_review:", "group_delete:", "group_delete_confirm:", "group_edit:")):
+        try:
+            grupo_id = int(data.split(":", 1)[1])
+        except ValueError:
+            grupo_id = 0
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id)
+        if grupo is None:
+            await query.edit_message_text("Ese grupo ya no existe.", reply_markup=menu_grupos())
+            return True
+        context.user_data.clear()
+        if data.startswith("group_review:"):
+            await revisar_cuentas_grupo(context, query, grupo_id)
+        elif data.startswith("group_edit:"):
+            borrador = {"nombre": grupo["nombre"], "grupo_id": grupo_id, "token": uuid.uuid4().hex[:12],
+                        "usuarios": set(grupo["usuarios"]), "pagina": 0,
+                        "message_id": getattr(query.message, "message_id", None)}
+            context.user_data[STATE] = GROUP_MEMBERS
+            context.user_data[GROUP_DRAFT] = borrador
+            await mostrar_seleccion_grupo(query, borrador)
+        elif data.startswith("group_delete_confirm:"):
+            db.eliminar_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id)
+            await query.edit_message_text(f"✅ Grupo eliminado: {grupo['nombre']}.", reply_markup=menu_grupos())
+        else:
+            await query.edit_message_text(
+                f"🗑 ¿Eliminar el grupo <b>{esc(grupo['nombre'])}</b>?\n\nLos perfiles seguirán disponibles en el bot.",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Eliminar grupo", callback_data=f"group_delete_confirm:{grupo_id}", style="danger")],
+                    [InlineKeyboardButton("Cancelar", callback_data="groups_delete")],
+                ]),
+            )
+        return True
+
+    if data.startswith(("group_pick:", "group_page:", "group_save:")):
+        partes = data.split(":", 2)
+        borrador = context.user_data.get(GROUP_DRAFT)
+        if (not borrador or context.user_data.get(STATE) != GROUP_MEMBERS or len(partes) < 2
+                or partes[1] != borrador["token"]
+                or borrador.get("message_id") != getattr(query.message, "message_id", None)):
+            await query.edit_message_text("Esta selección quedó desactualizada. Volvé al menú de grupos.", reply_markup=menu_grupos())
+            return True
+        cuentas = preparar_seleccion_grupo(borrador)
+        if partes[0] == "group_pick" and len(partes) == 3:
+            username = partes[2]
+            if username in {c["username"] for c in cuentas}:
+                if username in borrador["usuarios"]:
+                    borrador["usuarios"].remove(username)
+                else:
+                    borrador["usuarios"].add(username)
+        elif partes[0] == "group_page" and len(partes) == 3:
+            try:
+                borrador["pagina"] = int(partes[2])
+            except ValueError:
+                borrador["pagina"] = 0
+        elif partes[0] == "group_save":
+            modificando = borrador.get("grupo_id") is not None
+            if not borrador["usuarios"] and not modificando:
+                await query.edit_message_text(
+                    "Seleccioná al menos un perfil antes de crear el grupo.\n\n" + texto_seleccion_grupo(borrador),
+                    parse_mode="HTML", reply_markup=menu_seleccion_grupo(borrador),
+                )
+                return True
+            try:
+                if modificando:
+                    db.modificar_grupo_cuentas(AUTHORIZED_CHAT_ID, borrador["grupo_id"], list(borrador["usuarios"]))
+                else:
+                    db.crear_grupo_cuentas(AUTHORIZED_CHAT_ID, borrador["nombre"], list(borrador["usuarios"]))
+            except ValueError as error:
+                context.user_data.clear()
+                if modificando:
+                    await query.edit_message_text(str(error), reply_markup=menu_grupos())
+                    return True
+                context.user_data[STATE] = GROUP_NAME
+                await query.edit_message_text(
+                    f"{error}\n\nEscribí otro nombre para el grupo.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="groups_menu")]]),
+                )
+                return True
+            nombre, cantidad = borrador["nombre"], len(borrador["usuarios"])
+            context.user_data.clear()
+            accion = "modificado" if modificando else "creado"
+            await query.edit_message_text(f"✅ Grupo {accion}: {nombre}.\nPerfiles: {cantidad}.", reply_markup=menu_grupos())
+            return True
+        await mostrar_seleccion_grupo(query, borrador)
+        return True
+    return False
+
+
 async def callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2483,6 +2931,14 @@ async def callback(
     query = update.callback_query
 
     if not query:
+        return
+
+    if (
+        query.data == "chat_clean_confirm"
+        and autorizado(update)
+        and int(update.effective_chat.id) in LIMPIEZAS_CHAT_EN_CURSO
+    ):
+        await query.answer("La limpieza ya está en curso.")
         return
 
     await query.answer()
@@ -2500,6 +2956,9 @@ async def callback(
         )
 
     data = query.data or ""
+
+    if await callback_grupos(context, query, data):
+        return
 
     if data == "menu":
         context.user_data.clear()
@@ -2527,6 +2986,11 @@ async def callback(
             parse_mode="HTML",
             reply_markup=menu_revisar_historias(),
         )
+        return
+
+    if data == "review_featured":
+        context.user_data.clear()
+        await revisar_cuentas_destacadas(context, query)
         return
 
     if data == "publications_menu":
@@ -4178,7 +4642,7 @@ async def callback(
         await query.edit_message_text(
             (
                 "🧹 <b>LIMPIAR CHAT COMPLETO</b>\n\n"
-                "Se hará una limpieza general del chat:\n\n"
+                "Se borrarán los mensajes de texto recientes del chat:\n\n"
                 "🗑 textos\n"
                 "🗑 comandos /start\n"
                 "🗑 avisos\n"
@@ -4197,7 +4661,7 @@ async def callback(
                 [
                     [
                         InlineKeyboardButton(
-                            "🧹 Sí, limpiar TODO menos multimedia",
+                            "🧹 Sí, limpiar mensajes",
                             callback_data="chat_clean_confirm",
                         )
                     ],
@@ -4213,213 +4677,33 @@ async def callback(
         return
 
     if data == "chat_clean_confirm":
-        chat_id = int(
-            update.effective_chat.id
-        )
-
+        chat_id = int(update.effective_chat.id)
         if query.message is None:
             await enviar_texto_bot(
-                context,
-                chat_id=chat_id,
+                context, chat_id=chat_id,
                 text="❌ No pude determinar el mensaje actual del chat.",
                 disable_notification=True,
             )
             return
 
-        max_message_id = int(
-            query.message.message_id
-        )
-
-        # Protegemos toda la multimedia conocida.
-        protegidos = db.ids_multimedia_protegida_chat(
-            chat_id
-        )
-
-        # También nos aseguramos de proteger toda la multimedia que
-        # StoryPulse ya había registrado en versiones anteriores.
-        protegidos.update(
-            db.multimedia_reciente_telegram(
-                chat_id,
-                limite=100,
-                horas=48,
+        LIMPIEZAS_CHAT_EN_CURSO.add(chat_id)
+        trabajo = None
+        try:
+            await query.edit_message_text(
+                "🧹 <b>Limpiando mensajes…</b>\n\n"
+                "Se borrarán los textos recientes. Las fotos y los videos se conservarán.\n"
+                "Podés seguir usando el bot mientras termina.",
+                parse_mode="HTML", reply_markup=None,
             )
-        )
-
-        # El chat de este bot es pequeño, pero ponemos un techo alto
-        # para evitar recorrer cantidades absurdas de IDs.
-        MAX_IDS_A_RECORRER = 5000
-
-        min_message_id = max(
-            1,
-            max_message_id - MAX_IDS_A_RECORRER + 1,
-        )
-
-        candidatos = [
-            message_id
-            for message_id in range(
-                min_message_id,
-                max_message_id + 1,
+            trabajo = limpiar_chat_en_segundo_plano(
+                context, query, chat_id, int(query.message.message_id),
             )
-            if message_id not in protegidos
-        ]
-
-        # Procesamos desde los IDs más recientes hacia atrás.
-        candidatos.sort(
-            reverse=True
-        )
-
-        borrados_estimados = 0
-        ya_inexistentes = 0
-        fallidos = 0
-        detenidos_por_antiguedad = False
-
-        async def borrar_individual(
-            message_id: int,
-        ) -> str:
-            try:
-                resultado = await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=int(message_id),
-                )
-
-                if resultado:
-                    return "borrado"
-
-                return "fallido"
-
-            except TelegramError as error:
-                detalle = str(error).lower()
-
-                if (
-                    "message to delete not found" in detalle
-                    or "message not found" in detalle
-                ):
-                    return "inexistente"
-
-                if (
-                    "message can't be deleted" in detalle
-                    or "message cannot be deleted" in detalle
-                    or "48 hours" in detalle
-                ):
-                    return "antiguo"
-
-                logger.warning(
-                    "LIMPIAR CHAT GENERAL: no se pudo borrar "
-                    "chat_id=%s message_id=%s: %s",
-                    chat_id,
-                    message_id,
-                    error,
-                )
-                return "fallido"
-
-        # Lotes de 100. Telegram puede omitir IDs inexistentes.
-        # Si un lote falla, bajamos a borrado individual para ese lote.
-        for inicio in range(
-            0,
-            len(candidatos),
-            100,
-        ):
-            lote_desc = candidatos[
-                inicio:inicio + 100
-            ]
-
-            if not lote_desc:
-                continue
-
-            lote = sorted(
-                lote_desc
-            )
-
-            try:
-                resultado = await context.bot.delete_messages(
-                    chat_id=chat_id,
-                    message_ids=lote,
-                )
-
-                if resultado:
-                    # Telegram considera exitoso el lote aunque algunos
-                    # IDs ya no existan. Para el objetivo de limpieza
-                    # nos sirve como procesado.
-                    borrados_estimados += len(lote)
-                    continue
-
-            except TelegramError as error_lote:
-                logger.info(
-                    "Lote de limpieza rechazado; "
-                    "se intentará individualmente. "
-                    "IDs %s-%s: %s",
-                    min(lote),
-                    max(lote),
-                    error_lote,
-                )
-
-            antiguos_en_lote = 0
-            borrados_en_lote = 0
-
-            for message_id in lote_desc:
-                estado = await borrar_individual(
-                    message_id
-                )
-
-                if estado == "borrado":
-                    borrados_estimados += 1
-                    borrados_en_lote += 1
-
-                elif estado == "inexistente":
-                    ya_inexistentes += 1
-
-                elif estado == "antiguo":
-                    antiguos_en_lote += 1
-
-                else:
-                    fallidos += 1
-
-                await asyncio.sleep(0.035)
-
-            # IDs menores son más antiguos. Si llegamos a un bloque
-            # completo donde prácticamente todo ya supera el límite
-            # de Telegram y no borramos nada, no tiene sentido seguir.
-            if (
-                borrados_en_lote == 0
-                and antiguos_en_lote >= max(
-                    20,
-                    int(len(lote_desc) * 0.80),
-                )
-            ):
-                detenidos_por_antiguedad = True
-                break
-
-        # La tabla V2.3 ya no es necesaria para descubrir menús viejos,
-        # pero limpiamos sus registros vencidos para mantener la DB sana.
-        db.purgar_registros_chat_limpiables_vencidos(
-            chat_id,
-            horas=48,
-        )
-
-        texto_final = (
-            "🧹 <b>Chat limpiado</b>\n\n"
-            "✅ Se procesó la limpieza general del chat.\n"
-            f"📸 Multimedia protegida: <b>{len(protegidos)}</b>\n"
-            f"⚠️ Fallos puntuales: <b>{fallidos}</b>"
-        )
-
-        if detenidos_por_antiguedad:
-            texto_final += (
-                "\n\nℹ️ Se alcanzaron mensajes demasiado antiguos "
-                "para que Telegram permita borrarlos."
-            )
-
-        texto_final += (
-            "\n\n📸 Las fotos/videos protegidos quedaron intactos."
-        )
-
-        await enviar_texto_bot(
-            context,
-            chat_id=chat_id,
-            text=texto_final,
-            parse_mode="HTML",
-            disable_notification=True,
-        )
+            context.application.create_task(trabajo, update=update, name=f"limpiar-chat-{chat_id}")
+        except BaseException:
+            if trabajo is not None:
+                trabajo.close()
+            LIMPIEZAS_CHAT_EN_CURSO.discard(chat_id)
+            raise
         return
 
     if data == "media_delete":
@@ -4759,6 +5043,34 @@ async def recibir_texto(
 
     estado = context.user_data.get(STATE)
 
+    if estado == GROUP_NAME:
+        try:
+            nombre = db.validar_nombre_grupo(texto)
+            if any(g["nombre"].casefold() == nombre.casefold()
+                   for g in db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID)):
+                raise ValueError("Ya existe un grupo con ese nombre. Elegí otro nombre.")
+        except ValueError as error:
+            await responder_texto(update, f"❌ {error}")
+            return
+        if not cargar_cuentas():
+            context.user_data.clear()
+            await responder_texto(update, "Primero agregá perfiles desde Gestionar cuentas.", reply_markup=menu_grupos())
+            return
+        borrador = {"nombre": nombre, "token": uuid.uuid4().hex[:12], "usuarios": set(), "pagina": 0}
+        context.user_data.clear()
+        context.user_data[STATE] = GROUP_MEMBERS
+        context.user_data[GROUP_DRAFT] = borrador
+        teclado = menu_seleccion_grupo(borrador)
+        mensaje = await responder_texto(update, texto_seleccion_grupo(borrador), parse_mode="HTML", reply_markup=teclado)
+        borrador["message_id"] = getattr(mensaje, "message_id", None)
+        return
+
+    if estado == GROUP_MEMBERS:
+        borrador = context.user_data.get(GROUP_DRAFT) or {}
+        accion = "Guardar cambios" if borrador.get("grupo_id") is not None else "Crear grupo"
+        await responder_texto(update, f"Elegí los perfiles con los botones del mensaje anterior y tocá {accion} al terminar.")
+        return
+
     if estado == ADD_NAME:
         if not texto:
             return
@@ -4768,7 +5080,7 @@ async def recibir_texto(
 
         await responder_texto(update,
             "Ahora escribí el username de Instagram.\n"
-            "Ejemplo: leo_messi"
+            "Ejemplo: usuario_ejemplo"
         )
         return
 
