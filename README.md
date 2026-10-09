@@ -1,4 +1,4 @@
-# StoryPulse Private v2.0
+# StoryPulse Private v2.1
 
 <p align="center">
 <img src="http://imgfz.com/i/QnmALpy.png" title="StoryPulse">
@@ -10,7 +10,7 @@
 
 <p align="center">
 <a href="https://github.com/FacuSecX"><img title="Autor" src="https://img.shields.io/badge/Author-Facu%20-blue?style=for-the-badge&logo=github"></a>
-<a href=""><img title="Version" src="https://img.shields.io/badge/Version-2.0-red?style=for-the-badge&logo="></a>
+<a href=""><img title="Version" src="https://img.shields.io/badge/Version-2.1-red?style=for-the-badge&logo="></a>
 </p>
 
 <p align="center">
