@@ -1,4 +1,4 @@
-# StoryPulse v2.0
+# StoryPulse v2.1
 # Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +72,29 @@ def inicializar() -> None:
         # ----------------------------------------------------
         # Tablas base
         # ----------------------------------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS grupos_cuentas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                nombre TEXT NOT NULL,
+                nombre_clave TEXT NOT NULL,
+                creado_en TEXT NOT NULL,
+                UNIQUE (chat_id, nombre_clave)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS miembros_grupo_cuentas (
+                grupo_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                PRIMARY KEY (grupo_id, username),
+                FOREIGN KEY (grupo_id) REFERENCES grupos_cuentas(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS historias_enviadas (
@@ -780,6 +804,113 @@ def limpiar_antirepeticion_perfil(
         conn.commit()
 
     return eliminados
+
+
+# ============================================================
+# GRUPOS DE CUENTAS
+# ============================================================
+
+def validar_nombre_grupo(nombre: str) -> str:
+    nombre = unicodedata.normalize("NFC", " ".join(str(nombre).split()))
+    if not nombre or len(nombre) > 48:
+        raise ValueError("El nombre del grupo debe tener entre 1 y 48 caracteres.")
+    if nombre.casefold() in {"favoritas", "revisar favoritas"}:
+        raise ValueError("Favoritas ya está disponible en el menú. Elegí otro nombre.")
+    return nombre
+
+
+def crear_grupo_cuentas(chat_id: int, nombre: str, usernames: list[str]) -> int:
+    nombre = validar_nombre_grupo(nombre)
+    usuarios = sorted({str(u).strip().removeprefix("@").lower() for u in usernames})
+    if not usuarios or any(not re.fullmatch(r"[a-z0-9._]{1,30}", u) for u in usuarios):
+        raise ValueError("Seleccioná al menos un perfil válido para el grupo.")
+    with _LOCK, conectar() as conn:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO grupos_cuentas (chat_id, nombre, nombre_clave, creado_en) "
+                "VALUES (?, ?, ?, ?)",
+                (int(chat_id), nombre, nombre.casefold(), ahora_iso()),
+            )
+            grupo_id = int(cursor.lastrowid)
+            conn.executemany(
+                "INSERT INTO miembros_grupo_cuentas (grupo_id, username) VALUES (?, ?)",
+                [(grupo_id, usuario) for usuario in usuarios],
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as error:
+            conn.rollback()
+            raise ValueError("Ya existe un grupo con ese nombre. Elegí otro nombre.") from error
+    return grupo_id
+
+
+def listar_grupos_cuentas(chat_id: int) -> list[dict]:
+    with _LOCK, conectar() as conn:
+        filas = conn.execute(
+            "SELECT id, nombre FROM grupos_cuentas WHERE chat_id = ? ORDER BY nombre_clave, id",
+            (int(chat_id),),
+        ).fetchall()
+        miembros = conn.execute(
+            "SELECT m.grupo_id, m.username FROM miembros_grupo_cuentas m "
+            "JOIN grupos_cuentas g ON g.id = m.grupo_id "
+            "WHERE g.chat_id = ? ORDER BY m.username",
+            (int(chat_id),),
+        ).fetchall()
+    grupos = {int(fila["id"]): {"id": int(fila["id"]), "nombre": str(fila["nombre"]), "usuarios": []}
+              for fila in filas}
+    for miembro in miembros:
+        grupos[int(miembro["grupo_id"])]["usuarios"].append(str(miembro["username"]))
+    return list(grupos.values())
+
+
+def obtener_grupo_cuentas(chat_id: int, grupo_id: int) -> dict | None:
+    with _LOCK, conectar() as conn:
+        fila = conn.execute(
+            "SELECT id, nombre FROM grupos_cuentas WHERE chat_id = ? AND id = ?",
+            (int(chat_id), int(grupo_id)),
+        ).fetchone()
+        if fila is None:
+            return None
+        miembros = conn.execute(
+            "SELECT username FROM miembros_grupo_cuentas WHERE grupo_id = ? ORDER BY username",
+            (int(grupo_id),),
+        ).fetchall()
+    return {"id": int(fila["id"]), "nombre": str(fila["nombre"]),
+            "usuarios": [str(m["username"]) for m in miembros]}
+
+
+def modificar_grupo_cuentas(chat_id: int, grupo_id: int, usernames: list[str]) -> None:
+    """Reemplazar los miembros sin cambiar la identidad ni el nombre del grupo."""
+    usuarios = sorted({str(u).strip().removeprefix("@").lower() for u in usernames})
+    if any(not re.fullmatch(r"[a-z0-9._]{1,30}", u) for u in usuarios):
+        raise ValueError("Los perfiles seleccionados no son válidos.")
+    with _LOCK, conectar() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existe = conn.execute(
+            "SELECT 1 FROM grupos_cuentas WHERE chat_id = ? AND id = ?",
+            (int(chat_id), int(grupo_id)),
+        ).fetchone()
+        if existe is None:
+            raise ValueError("Ese grupo ya no existe. Volvé al menú de grupos.")
+        conn.execute("DELETE FROM miembros_grupo_cuentas WHERE grupo_id = ?", (int(grupo_id),))
+        conn.executemany(
+            "INSERT INTO miembros_grupo_cuentas (grupo_id, username) VALUES (?, ?)",
+            [(int(grupo_id), usuario) for usuario in usuarios],
+        )
+        conn.commit()
+
+
+def eliminar_grupo_cuentas(chat_id: int, grupo_id: int) -> bool:
+    with _LOCK, conectar() as conn:
+        existe = conn.execute(
+            "SELECT 1 FROM grupos_cuentas WHERE chat_id = ? AND id = ?",
+            (int(chat_id), int(grupo_id)),
+        ).fetchone()
+        if existe is None:
+            return False
+        conn.execute("DELETE FROM miembros_grupo_cuentas WHERE grupo_id = ?", (int(grupo_id),))
+        conn.execute("DELETE FROM grupos_cuentas WHERE chat_id = ? AND id = ?", (int(chat_id), int(grupo_id)))
+        conn.commit()
+    return True
 
 
 # ============================================================
@@ -1499,7 +1630,7 @@ def registrar_mensaje_chat_limpiable(
     with _LOCK, conectar() as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO mensajes_chat_limpiables
+            INSERT OR IGNORE INTO mensajes_chat_limpiables
             (
                 chat_id,
                 message_id,
