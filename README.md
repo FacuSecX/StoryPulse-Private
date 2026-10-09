@@ -65,7 +65,7 @@ Está pensado principalmente para ejecutarse de forma continua en un servidor o 
 - 🧩 **Actualizar sesiones:** comprobación de una sesión nueva contra los perfiles agregados para incorporarla como respaldo donde tenga acceso, conservando las preferencias y el avance de la comprobación.
 - ⭐ **Cuentas favoritas:** permite destacar perfiles en los menus
 - 👤 **Crear Grupos de perfiles:** permite crear/eliminar y modificar grupos de perfiles ya añadidos para hacer revisiones rapidas
-- - 🎯 **Activar o desactivar Multimedia:** permite elegir si queremos que las historias se envien al chat de telegram o si solo queremos que se almacenen en el servidor
+- - 🎯 **Activar o desactivar Multimedia:** permite elegir si queremos que las historias se envian al chat de telegram
 - 💾 **Sesiones independientes y persistentes:** cada cuenta conserva su archivo de autenticación, su estado y sus asociaciones entre reinicios.
 
 ---
