@@ -54,7 +54,7 @@ Está pensado principalmente para ejecutarse de forma continua en un servidor o 
 
 ---
 
-## Funcionalidades 2.0
+## Funcionalidades v2.1
 
 - 🔐 **Sistema multi-autenticación:** varias cuentas de Instagram con sus propias sesiones; si falla una consulta, se intenta con otra sesión habilitada que tenga acceso registrado al mismo perfil.
 - 🔄 **Programaciones variables entre sesiones:** elección de una o varias sesiones con acceso confirmado y rotación entre ellas en las revisiones automáticas, tanto por intervalos como por horarios específicos.
@@ -63,12 +63,14 @@ Está pensado principalmente para ejecutarse de forma continua en un servidor o 
 - 🛡️ **Antirepetición mejorada:** control persistente por IDs, compartido entre sesiones, filtrado de elementos repetidos y protección frente a revisiones manuales y automáticas simultáneas.
 - 🧹 **Reinicio selectivo de la antirepetición:** por perfil y por tipo de contenido —Stories, publicaciones o destacadas—, o de todos sus registros, con confirmación desde Telegram.
 - 🧩 **Actualizar sesiones:** comprobación de una sesión nueva contra los perfiles agregados para incorporarla como respaldo donde tenga acceso, conservando las preferencias y el avance de la comprobación.
-- ⭐ **Cuentas favoritas:** perfiles marcados con una estrella y botones destacados para encontrarlos fácilmente en los menús.
+- ⭐ **Cuentas favoritas:** permite destacar perfiles en los menus
+- 👤 **Crear Grupos de perfiles:** permite crear/eliminar y modificar grupos de perfiles ya añadidos para hacer revisiones rapidas
+- - 🎯 **Activar o desactivar Multimedia:** permite elegir si queremos que las historias se envien al chat de telegram o si solo queremos que se almacenen en el servidor
 - 💾 **Sesiones independientes y persistentes:** cada cuenta conserva su archivo de autenticación, su estado y sus asociaciones entre reinicios.
 
 ---
 
-# Objetivo v2.0
+# Objetivo v2.1
 
 El sistema multi-autenticación está pensado para que, cuando falla la consulta de un perfil, pueda intentarse desde varias cuentas con acceso confirmado, reduciendo las revisiones manuales de las sesiones.
 
