@@ -31,6 +31,19 @@ Está pensado principalmente para ejecutarse de forma continua en un servidor o 
 
 ---
 
+## Vista previa en Telegram
+
+Ejemplo de una historia recibida con su fecha, hora y Story ID.
+
+<p align="left">
+  <img src="http://imgfz.com/i/x5ruSUt.png"
+       alt="Ejemplo de una historia recibida con StoryPulse en Telegram"
+       width="300">
+</p>
+
+---
+
+
 ## Funcionalidades
 
 - 👤 Consulta de perfiles públicos y privados accesibles por la cuenta autenticada.
