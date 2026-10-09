@@ -1,4 +1,4 @@
-# StoryPulse v2.0
+# StoryPulse v2.1
 # Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
 from __future__ import annotations
