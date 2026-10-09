@@ -1,6 +1,11 @@
-# StoryPulse v2.0
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# StoryPulse v2.1
 # Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
 
+guardarse correctamente.
+"""
 
 from __future__ import annotations
 
