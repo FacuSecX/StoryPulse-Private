@@ -1,7 +1,20 @@
-# StoryPulse v2.1
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
+"""Descarga de historias destacadas de Instagram.
+
+La consulta se mantiene separada del flujo de Stories normales porque una
+destacada es un carrusel persistente del perfil y debe archivarse por nombre.
+El módulo no envía contenido a Telegram: sólo devuelve un resumen y escribe
+los archivos dentro de HISTORYS_DIR.
+"""
 from __future__ import annotations
+from job_fallback import scoped_operation
+
+from story_metadata import consultar_destacada
 
 import json
 import html as html_lib
@@ -21,10 +34,12 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
 import database as db
+from media_cdn import solicitar_archivo_cdn
 from history import (
     STORIES_QUERY_HASH,
     _buscar_reels_media,
     _crear_contexto,
+    _datos_json_respuesta_recibida,
     _extension_desde_content_type,
     _guardar_estado_contexto,
     _image_url,
@@ -189,8 +204,6 @@ def _campo_id(grupo: dict[str, Any]) -> str | None:
         normalizado = _normalizar_id_destacada(grupo.get(clave))
         if normalizado:
             return normalizado
-    # Algunas respuestas actuales envuelven el carrusel en ``reel`` o
-    # ``highlight`` en vez de dejar el ID en el nodo principal.
     for clave in ("reel", "highlight", "highlight_reel", "node"):
         anidado = grupo.get(clave)
         if isinstance(anidado, dict):
@@ -231,9 +244,6 @@ def _es_clave_destacadas(clave: Any) -> bool:
     normalizada = re.sub(r"[^a-z]", "", str(clave).casefold())
     if normalizada in {re.sub(r"[^a-z]", "", item) for item in _CLAVES_DESTACADAS}:
         return True
-    # Instagram agrega sufijos como ``edge_user_to_highlights_connection``.
-    # ``highlight_reel_ids`` también es una fuente válida aunque sólo traiga
-    # IDs escalares.
     return "highlight" in normalizada and normalizada not in {"highlightcover"}
 
 
@@ -271,13 +281,9 @@ def extraer_grupos_destacadas(obj: Any) -> list[dict[str, str]]:
                 if _es_clave_destacadas(clave):
                     for grupo in _desenvolver_nodos(hijo):
                         _agregar_grupo(encontrados, vistos, grupo)
-                        # ``highlight_reel_ids`` puede ser una lista de
-                        # strings/enteros en vez de una lista de objetos.
                         if isinstance(grupo, str):
                             for item in _grupos_en_enlace(grupo):
                                 _agregar_grupo(encontrados, vistos, item)
-                        # Algunas respuestas anidan items o una lista de
-                        # carruseles dentro del mismo nodo.
                         recorrer(grupo)
                     if isinstance(hijo, list):
                         for item in hijo:
@@ -287,8 +293,6 @@ def extraer_grupos_destacadas(obj: Any) -> list[dict[str, str]]:
                                     "id": identificador,
                                     "title": "Destacada",
                                 })
-                # También se reconocen enlaces de highlights embebidos en
-                # nodos que no llevan una clave de highlight explícita.
                 if str(clave).casefold() in {"url", "href", "link", "permalink", "web_link"}:
                     for grupo in _grupos_en_enlace(hijo, valor.get("title") or valor.get("name")):
                         _agregar_grupo(encontrados, vistos, grupo)
@@ -325,13 +329,9 @@ def extraer_grupos_destacadas_de_html(documento: str) -> list[dict[str, str]]:
         attrs = coincidencia.group("attrs")
         etiqueta = re.search(r"(?:aria-label|title)\s*=\s*[\"']([^\"']+)", attrs, re.IGNORECASE)
         titulo_atributo = _texto_titulo_destacada(etiqueta.group(1) if etiqueta else "")
-        # ``aria-label=Ver historia destacada`` es una instrucción genérica,
-        # no el nombre del carrusel. Preferimos el texto visible y sólo
-        # usamos el atributo si contiene un título real.
         titulo = titulo or titulo_atributo or "Destacada"
         vistos.add(identificador)
         encontrados.append({"id": identificador, "title": titulo})
-    # JSON serializado o HTML minificado puede no contener una etiqueta <a>.
     for coincidencia in _HIGHLIGHT_URL_RE.finditer(texto):
         identificador = coincidencia.group(1)
         if identificador not in vistos:
@@ -388,8 +388,6 @@ def _fecha_destacada(item: dict[str, Any]) -> str:
             return fecha.astimezone(HIGHLIGHTS_TIMEZONE).strftime("%Y-%m-%d")
         except (TypeError, ValueError, OSError, OverflowError):
             continue
-    # Algunas respuestas de Instagram omiten la fecha. El nombre sigue
-    # manteniendo el formato solicitado y no usa el ID interno.
     return datetime.now(HIGHLIGHTS_TIMEZONE).strftime("%Y-%m-%d")
 
 
@@ -423,8 +421,6 @@ class _JsonScriptParser(HTMLParser):
         if tag.lower() != "script":
             return
         tipo = dict(attrs).get("type", "").lower()
-        # Instagram a veces omite el atributo type en los bloques JSON que
-        # contienen el estado inicial de la página.
         self._en_script = tipo in {"application/ld+json", "application/json", ""}
         self._partes = []
 
@@ -529,147 +525,122 @@ def _descargar_grupo(context, username: str, grupo: dict[str, str], carpeta: Pat
         try:
             progress_callback(dict(datos))
         except Exception:
-            # El progreso es informativo y nunca debe interrumpir la descarga.
             pass
 
-    page = context.new_page()
-    try:
-        response = page.goto(
-            _construir_url_destacada(grupo["id"]),
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
-        validar_respuesta_instagram(page, response, f"consultar destacada de @{username}")
-        try:
-            data = response.json()
-        except Exception as error:
-            raise ErrorConsultaInstagram("Instagram no devolvió JSON válido para una destacada.") from error
-        validar_datos_instagram(data)
-        reels = _buscar_reels_media(data) or []
-        items: list[dict[str, Any]] = []
-        for reel in reels:
-            if isinstance(reel, dict) and isinstance(reel.get("items"), list):
-                items.extend(item for item in reel["items"] if isinstance(item, dict))
-        reportar({"historias_detectadas": len(items)})
+    items = consultar_destacada(context, username, grupo['id'])
+    reportar({"historias_detectadas": len(items)})
 
-        archivos: list[DestacadaDescargada] = []
-        reservados: set[Path] = set()
-        posiciones_sin_chat: dict[tuple[str, str], int] = {}
-        existentes_iniciales: dict[tuple[str, str], list[Path]] = {}
-        for item in items:
-            story_pk = str(item.get("id") or item.get("pk") or "").strip()
-            media_url = _video_url(item) or _image_url(item)
-            if not story_pk or not media_url:
-                reportar({"historias_procesadas": 1, "fallidas": 1})
-                continue
-            es_video = bool(_video_url(item))
-            fecha = _fecha_destacada(item)
-            extension_sugerida = "mp4" if es_video else "jpg"
+    archivos: list[DestacadaDescargada] = []
+    reservados: set[Path] = set()
+    posiciones_sin_chat: dict[tuple[str, str], int] = {}
+    existentes_iniciales: dict[tuple[str, str], list[Path]] = {}
+    for item in items:
+        story_pk = str(item.get("id") or item.get("pk") or "").strip()
+        media_url = _video_url(item) or _image_url(item)
+        if not story_pk or not media_url:
+            reportar({"historias_procesadas": 1, "fallidas": 1})
+            continue
+        es_video = bool(_video_url(item))
+        fecha = _fecha_destacada(item)
+        extension_sugerida = "mp4" if es_video else "jpg"
 
-            # El registro es la fuente principal de antirepetición. También
-            # adoptamos archivos creados por la versión anterior, para que la
-            # primera ejecución con esta mejora no vuelva a descargarlos.
-            if chat_id is not None and db.destacada_ya_descargada(
-                    chat_id, username, grupo["id"], story_pk):
-                registro = db.obtener_destacada(
-                    chat_id, username, grupo["id"], story_pk
-                )
-                ruta_registrada = Path(registro["ruta"]) if registro and registro.get("ruta") else None
-                existentes = list(carpeta.glob(f"*_{story_pk}.*"))
-                ruta_existente = existentes[0] if existentes else ruta_registrada
-                if ruta_existente is not None:
-                    migrada = _migrar_archivo_destacada(
-                        ruta_existente,
-                        carpeta,
-                        username,
-                        fecha,
-                        extension_sugerida,
-                        reservados,
-                    )
-                    if migrada is not None:
-                        ruta_existente = migrada
-                        db.actualizar_ruta_destacada(
-                            chat_id,
-                            username,
-                            grupo["id"],
-                            story_pk,
-                            grupo=nombre_grupo,
-                            ruta=str(migrada),
-                        )
-                if ruta_existente is None:
-                    ruta_existente = carpeta
-                archivos.append(DestacadaDescargada(
-                    story_pk, nombre_grupo, ruta_existente, False
-                ))
-                reportar({"historias_procesadas": 1, "archivos_guardados": 1})
-                continue
-
+        if chat_id is not None and db.destacada_ya_descargada(
+                chat_id, username, grupo["id"], story_pk):
+            registro = db.obtener_destacada(
+                chat_id, username, grupo["id"], story_pk
+            )
+            ruta_registrada = Path(registro["ruta"]) if registro and registro.get("ruta") else None
             existentes = list(carpeta.glob(f"*_{story_pk}.*"))
-            if existentes:
-                ruta_existente = existentes[0]
-                if chat_id is not None:
-                    db.registrar_destacada(
-                        chat_id, username, grupo["id"], story_pk,
-                        grupo=nombre_grupo, ruta=str(ruta_existente),
-                    )
-                archivos.append(DestacadaDescargada(
-                    story_pk, nombre_grupo, ruta_existente, False
-                ))
-                reportar({"historias_procesadas": 1, "archivos_guardados": 1})
-                continue
-
-            # Las llamadas independientes que no vienen del bot no tienen
-            # chat_id para consultar SQLite. Conservamos su antirepetición
-            # mediante el nombre nuevo, respetando el orden de las Stories de
-            # cada fecha sin confundir las reservas de esta misma ejecución.
-            if chat_id is None:
-                clave_fecha = (fecha, extension_sugerida)
-                posicion = posiciones_sin_chat.get(clave_fecha, 0) + 1
-                posiciones_sin_chat[clave_fecha] = posicion
-                iniciales = existentes_iniciales.setdefault(
-                    clave_fecha,
-                    sorted(carpeta.glob(f"{username}_{fecha}*.{extension_sugerida}")),
+            ruta_existente = existentes[0] if existentes else ruta_registrada
+            if ruta_existente is not None:
+                migrada = _migrar_archivo_destacada(
+                    ruta_existente,
+                    carpeta,
+                    username,
+                    fecha,
+                    extension_sugerida,
+                    reservados,
                 )
-                if posicion <= len(iniciales):
-                    archivos.append(DestacadaDescargada(
-                        story_pk, nombre_grupo, iniciales[posicion - 1], False
-                    ))
-                    continue
+                if migrada is not None:
+                    ruta_existente = migrada
+                    db.actualizar_ruta_destacada(
+                        chat_id,
+                        username,
+                        grupo["id"],
+                        story_pk,
+                        grupo=nombre_grupo,
+                        ruta=str(migrada),
+                    )
+            if ruta_existente is None:
+                ruta_existente = carpeta
+            archivos.append(DestacadaDescargada(
+                story_pk, nombre_grupo, ruta_existente, False
+            ))
+            reportar({"historias_procesadas": 1, "archivos_guardados": 1})
+            continue
 
-            respuesta_media = context.request.get(
-                media_url,
-                headers={"Referer": "https://www.instagram.com/", "Accept": "*/*"},
-                timeout=60_000,
-                fail_on_status_code=False,
-            )
-            try:
-                contenido, content_type = _contenido_y_tipo(respuesta_media)
-            finally:
-                respuesta_media.dispose()
-            extension = _extension_desde_content_type(content_type, es_video)
-            ruta = _nombre_archivo_destacada(
-                carpeta, username, fecha, extension, reservados
-            )
-            nueva = not ruta.exists()
-            if nueva:
-                carpeta.mkdir(parents=True, exist_ok=True)
-                ruta.write_bytes(contenido)
+        existentes = list(carpeta.glob(f"*_{story_pk}.*"))
+        if existentes:
+            ruta_existente = existentes[0]
             if chat_id is not None:
                 db.registrar_destacada(
                     chat_id, username, grupo["id"], story_pk,
-                    grupo=nombre_grupo, ruta=str(ruta),
+                    grupo=nombre_grupo, ruta=str(ruta_existente),
                 )
-            archivos.append(DestacadaDescargada(story_pk, nombre_grupo, ruta, nueva))
-            reportar({
-                "historias_procesadas": 1,
-                "archivos_guardados": 1,
-                "archivos_nuevos": int(nueva),
-            })
-        return archivos
-    finally:
-        page.close()
+            archivos.append(DestacadaDescargada(
+                story_pk, nombre_grupo, ruta_existente, False
+            ))
+            reportar({"historias_procesadas": 1, "archivos_guardados": 1})
+            continue
+
+        if chat_id is None:
+            clave_fecha = (fecha, extension_sugerida)
+            posicion = posiciones_sin_chat.get(clave_fecha, 0) + 1
+            posiciones_sin_chat[clave_fecha] = posicion
+            iniciales = existentes_iniciales.setdefault(
+                clave_fecha,
+                sorted(carpeta.glob(f"{username}_{fecha}*.{extension_sugerida}")),
+            )
+            if posicion <= len(iniciales):
+                archivos.append(DestacadaDescargada(
+                    story_pk, nombre_grupo, iniciales[posicion - 1], False
+                ))
+                continue
+
+        respuesta_media = solicitar_archivo_cdn(
+            context.request,
+            media_url,
+            headers={"Referer": "https://www.instagram.com/", "Accept": "*/*"},
+            progress_callback=reportar,
+        )
+        try:
+            contenido, content_type = _contenido_y_tipo(respuesta_media)
+        finally:
+            respuesta_media.dispose()
+        extension = _extension_desde_content_type(content_type, es_video)
+        ruta = _nombre_archivo_destacada(
+            carpeta, username, fecha, extension, reservados
+        )
+        nueva = not ruta.exists()
+        if nueva:
+            carpeta.mkdir(parents=True, exist_ok=True)
+            ruta.write_bytes(contenido)
+        if chat_id is not None:
+            db.registrar_destacada(
+                chat_id, username, grupo["id"], story_pk,
+                grupo=nombre_grupo, ruta=str(ruta),
+            )
+        archivos.append(DestacadaDescargada(story_pk, nombre_grupo, ruta, nueva))
+        reportar({
+            "historias_procesadas": 1,
+            "archivos_guardados": 1,
+            "archivos_nuevos": int(nueva),
+        })
+    return archivos
 
 
+
+@scoped_operation
 @con_sesiones()
 def descargar_destacadas(username: str, user_id: int | None = None,
                          chat_id: int | None = None,
@@ -711,8 +682,6 @@ def descargar_destacadas(username: str, user_id: int | None = None,
     if chat_id is not None:
         db.inicializar()
     comprobar_sesion_local()
-    # user_id se conserva para que el bot no tenga que resolver otra vez el
-    # perfil. La navegación al perfil es la fuente de los IDs de destacados.
     _ = int(user_id) if user_id is not None else None
     carpeta_raiz = HISTORYS_DIR / username / HIGHLIGHTS_DIR_NAME
 
@@ -729,10 +698,7 @@ def descargar_destacadas(username: str, user_id: int | None = None,
                 if not ("graphql" in url or "/api/" in url or "profile" in url.lower()):
                     return
                 try:
-                    tipo = (getattr(response, "headers", {}) or {}).get("content-type", "")
-                    if tipo and "json" not in tipo.lower():
-                        return
-                    respuestas.append(response.json())
+                    respuestas.extend(_datos_json_respuesta_recibida(response))
                 except Exception:
                     return
 
@@ -743,10 +709,6 @@ def descargar_destacadas(username: str, user_id: int | None = None,
                 timeout=60_000,
             )
             validar_respuesta_instagram(page, response, f"abrir @{username}")
-            # Los círculos de destacadas se cargan después del HTML inicial.
-            # Sin esta espera la página puede verse correctamente en el
-            # navegador, pero todavía no haber recibido su JSON al momento de
-            # inspeccionarla.
             try:
                 page.wait_for_timeout(7_000)
             except Exception:
@@ -758,8 +720,6 @@ def descargar_destacadas(username: str, user_id: int | None = None,
             try:
                 validar_pagina_instagram(page)
             except Exception:
-                # El JSON de GraphQL sigue siendo válido si la página sólo
-                # entrega una pantalla mínima sin texto de perfil.
                 if not respuestas:
                     raise
             try:
@@ -794,8 +754,6 @@ def descargar_destacadas(username: str, user_id: int | None = None,
                     vistos[identificador] = grupo
                     grupos.append(grupo)
                     return
-                # El JSON suele tener el título real; si llegó sin título,
-                # completarlo con el texto visible del DOM.
                 titulo = _texto_titulo_destacada(grupo.get("title"))
                 if anterior.get("title") == "Destacada" and titulo and titulo != "Destacada":
                     anterior["title"] = titulo
@@ -806,9 +764,6 @@ def descargar_destacadas(username: str, user_id: int | None = None,
             for grupo in html_destacadas + dom_destacadas:
                 agregar_grupo(grupo)
             if not grupos:
-                # Una respuesta vacía también puede significar que la sesión
-                # no puede ver el perfil privado. Confirmamos el acceso con
-                # el mecanismo existente antes de informar que no hay grupos.
                 if not any(_documento_confirma_acceso(documento, username)
                            for documento in respuestas):
                     comprobar_perfil_accesible(username)

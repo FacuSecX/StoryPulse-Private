@@ -1,0 +1,24 @@
+[Unit]
+Description=StoryPulse encrypted history backups
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/usr/local/lib/storypulse-backups
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/storypulse-backups/run.py
+Environment=HOME=/var/lib/storypulse-backups/mega
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+KillMode=control-group
+ProtectSystem=full
+ReadOnlyPaths=/historys
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

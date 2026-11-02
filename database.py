@@ -1,5 +1,8 @@
-# StoryPulse v2.1
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
 from __future__ import annotations
 
@@ -19,9 +22,6 @@ DB_FILE = BASE_DIR / "bot_historias.db"
 _LOCK = threading.RLock()
 
 
-# ============================================================
-# CONEXIÓN / UTILIDADES
-# ============================================================
 
 @contextmanager
 def conectar() -> Iterator[sqlite3.Connection]:
@@ -57,9 +57,6 @@ def _columnas(
     }
 
 
-# ============================================================
-# INICIALIZACIÓN / MIGRACIÓN
-# ============================================================
 
 def inicializar() -> None:
     """
@@ -69,9 +66,6 @@ def inicializar() -> None:
     """
     with _LOCK, conectar() as conn:
 
-        # ----------------------------------------------------
-        # Tablas base
-        # ----------------------------------------------------
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS grupos_cuentas (
@@ -111,9 +105,6 @@ def inicializar() -> None:
             """
         )
 
-        # Historias guardadas dentro de carruseles destacados. Se conserva el
-        # ID del carrusel y el ID de la Story para que una nueva sesión o un
-        # cambio de nombre del carrusel no vuelva a descargar el mismo item.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS historias_destacadas_descargadas (
@@ -157,7 +148,6 @@ def inicializar() -> None:
             """
         )
 
-        # Migración desde la primera versión del proyecto.
         columnas_programaciones = _columnas(
             conn,
             "programaciones",
@@ -209,21 +199,37 @@ def inicializar() -> None:
                 """
             )
 
-        # La selección de sesiones es independiente de la cadencia. Las
-        # programaciones existentes conservan su comportamiento habitual.
         for columna, definicion in (
             ("modalidad_sesiones", "TEXT NOT NULL DEFAULT 'normal'"),
             ("sesiones_rotacion_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("ultima_sesion_rotacion", "TEXT"),
+            ("grupo_id", "INTEGER"),
         ):
             if columna not in columnas_programaciones:
                 conn.execute(
                     f"ALTER TABLE programaciones ADD COLUMN {columna} {definicion}"
                 )
 
-        # ----------------------------------------------------
-        # Publicaciones descargadas / antirepetición
-        # ----------------------------------------------------
+        conn.execute("""
+            UPDATE programaciones
+            SET modalidad_sesiones = 'normal', sesiones_rotacion_json = '[]',
+                ultima_sesion_rotacion = NULL
+            WHERE grupo_id IS NOT NULL AND (
+                modalidad_sesiones != 'normal' OR sesiones_rotacion_json != '[]'
+                OR ultima_sesion_rotacion IS NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rotaciones_programacion_grupo (
+                chat_id INTEGER NOT NULL,
+                grupo_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                ultima_sesion TEXT NOT NULL,
+                PRIMARY KEY (chat_id, grupo_id, username)
+            )
+        """)
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS publicaciones_descargadas (
@@ -242,9 +248,6 @@ def inicializar() -> None:
             """
         )
 
-        # Estado de backfill de publicaciones por perfil.
-        # Las instalaciones existentes empiezan sin fila, por lo que la primera
-        # ejecución con esta versión hará un recorrido histórico completo.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS publicaciones_sync_perfil (
@@ -260,9 +263,6 @@ def inicializar() -> None:
             """
         )
 
-        # ----------------------------------------------------
-        # Multimedia enviada por el bot
-        # ----------------------------------------------------
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS multimedia_telegram (
@@ -277,10 +277,6 @@ def inicializar() -> None:
             """
         )
 
-        # ----------------------------------------------------
-        # Textos registrados por LIMPIAR CHAT V2.3
-        # Se mantiene por compatibilidad.
-        # ----------------------------------------------------
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS mensajes_chat_limpiables (
@@ -295,9 +291,6 @@ def inicializar() -> None:
             """
         )
 
-        # ----------------------------------------------------
-        # IDs de multimedia que LIMPIAR CHAT NO debe tocar
-        # ----------------------------------------------------
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS multimedia_protegida_chat (
@@ -312,8 +305,6 @@ def inicializar() -> None:
             """
         )
 
-        # Toda multimedia que ya estaba registrada por versiones
-        # anteriores también queda protegida automáticamente.
         conn.execute(
             """
             INSERT OR IGNORE INTO multimedia_protegida_chat
@@ -330,9 +321,6 @@ def inicializar() -> None:
             """
         )
 
-        # ----------------------------------------------------
-        # Índices
-        # ----------------------------------------------------
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_historias_usuario
@@ -405,9 +393,6 @@ def inicializar() -> None:
         conn.commit()
 
 
-# ============================================================
-# ANTIDUPLICACIÓN DE STORIES
-# ============================================================
 
 def historia_ya_enviada(
     chat_id: int,
@@ -609,9 +594,6 @@ def ids_destacadas_descargadas(
     return {(str(row["highlight_id"]), str(row["story_pk"])) for row in rows}
 
 
-# ============================================================
-# ANTIDUPLICACIÓN DE PUBLICACIONES
-# ============================================================
 
 def publicacion_ya_descargada(
     chat_id: int,
@@ -783,7 +765,6 @@ def limpiar_antirepeticion_perfil(
         for nombre, tabla in tablas.items():
             if tipo not in {"todo", nombre}:
                 continue
-            # Los nombres de tabla provienen exclusivamente del mapa fijo.
             eliminados[nombre] = int(conn.execute(
                 f"SELECT COUNT(*) AS total FROM {tabla} "
                 "WHERE chat_id = ? AND username = ?",
@@ -806,9 +787,6 @@ def limpiar_antirepeticion_perfil(
     return eliminados
 
 
-# ============================================================
-# GRUPOS DE CUENTAS
-# ============================================================
 
 def validar_nombre_grupo(nombre: str) -> str:
     nombre = unicodedata.normalize("NFC", " ".join(str(nombre).split()))
@@ -907,15 +885,74 @@ def eliminar_grupo_cuentas(chat_id: int, grupo_id: int) -> bool:
         ).fetchone()
         if existe is None:
             return False
+        conn.execute("DELETE FROM programaciones WHERE chat_id = ? AND grupo_id = ?", (int(chat_id), int(grupo_id)))
+        conn.execute("DELETE FROM rotaciones_programacion_grupo WHERE chat_id = ? AND grupo_id = ?", (int(chat_id), int(grupo_id)))
         conn.execute("DELETE FROM miembros_grupo_cuentas WHERE grupo_id = ?", (int(grupo_id),))
         conn.execute("DELETE FROM grupos_cuentas WHERE chat_id = ? AND id = ?", (int(chat_id), int(grupo_id)))
         conn.commit()
     return True
 
 
-# ============================================================
-# PROGRAMACIONES
-# ============================================================
+
+def clave_programacion_grupo(grupo_id: int) -> str:
+    if int(grupo_id) <= 0:
+        raise ValueError("Grupo inválido.")
+    return f"grupo-{int(grupo_id)}"
+
+
+def grupo_id_desde_clave(clave: str) -> int | None:
+    coincidencia = re.fullmatch(r"grupo-([1-9][0-9]*)", str(clave))
+    return int(coincidencia[1]) if coincidencia else None
+
+
+def grupo_id_programacion(row) -> int | None:
+    try:
+        return int(row["grupo_id"]) if row["grupo_id"] is not None else None
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _validar_destino_programacion(conn, chat_id, username):
+    grupo_id = grupo_id_desde_clave(username)
+    if grupo_id is not None:
+        if conn.execute("SELECT 1 FROM grupos_cuentas WHERE chat_id = ? AND id = ?",
+                        (int(chat_id), grupo_id)).fetchone() is None:
+            raise ValueError("Ese grupo ya no existe. Volvé a elegir el grupo.")
+    elif not re.fullmatch(r"[a-z0-9._]{1,30}", str(username).lower()):
+        raise ValueError("El destino de la programación no es válido.")
+    return grupo_id
+
+
+def preparar_rotacion_grupo(chat_id: int, grupo_id: int, username: str, sesiones: list[str]) -> list[str]:
+    sesiones = _normalizar_sesiones_rotacion(sesiones)
+    with _LOCK, conectar() as conn:
+        row = conn.execute("SELECT ultima_sesion FROM rotaciones_programacion_grupo "
+                           "WHERE chat_id = ? AND grupo_id = ? AND username = ?",
+                           (int(chat_id), int(grupo_id), username.lower())).fetchone()
+    ultima = row[0] if row is not None else None
+    if ultima not in sesiones:
+        return sesiones
+    siguiente = sesiones.index(ultima) + 1
+    return sesiones[siguiente:] + sesiones[:siguiente]
+
+
+def registrar_rotacion_grupo(chat_id: int, grupo_id: int, username: str, sesion_id: str, sesiones: list[str]) -> bool:
+    if sesion_id not in _normalizar_sesiones_rotacion(sesiones):
+        return False
+    with _LOCK, conectar() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        vigente = conn.execute("SELECT 1 FROM programaciones p JOIN miembros_grupo_cuentas m "
+                               "ON m.grupo_id = p.grupo_id WHERE p.chat_id = ? AND p.grupo_id = ? "
+                               "AND p.activa = 1 AND p.modalidad_sesiones = 'variable' AND m.username = ?",
+                               (int(chat_id), int(grupo_id), username.lower())).fetchone()
+        if vigente is None:
+            return False
+        conn.execute("INSERT INTO rotaciones_programacion_grupo VALUES (?, ?, ?, ?) "
+                     "ON CONFLICT(chat_id, grupo_id, username) DO UPDATE SET ultima_sesion = excluded.ultima_sesion",
+                     (int(chat_id), int(grupo_id), username.lower(), sesion_id))
+        conn.commit()
+        return True
+
 
 def guardar_programacion(
     chat_id: int,
@@ -941,10 +978,11 @@ def guardar_programacion(
         }
     )
     modalidad_sesiones, sesiones = _validar_modalidad_sesiones(
-        modalidad_sesiones, sesiones_rotacion
+        modalidad_sesiones, sesiones_rotacion, grupo=grupo_id_desde_clave(username) is not None
     )
 
     with _LOCK, conectar() as conn:
+        grupo_id = _validar_destino_programacion(conn, chat_id, username)
         conn.execute(
             """
             INSERT INTO programaciones
@@ -990,6 +1028,11 @@ def guardar_programacion(
                 json.dumps(sesiones, ensure_ascii=False),
             ),
         )
+        conn.execute("UPDATE programaciones SET grupo_id = ? WHERE chat_id = ? AND username = ?",
+                     (grupo_id, int(chat_id), str(username).lower()))
+        if grupo_id is not None:
+            conn.execute("DELETE FROM rotaciones_programacion_grupo WHERE chat_id = ? AND grupo_id = ?",
+                         (int(chat_id), grupo_id))
         conn.commit()
 
 
@@ -1032,10 +1075,11 @@ def guardar_programacion_intervalo(
         timezone.utc
     ).isoformat()
     modalidad_sesiones, sesiones = _validar_modalidad_sesiones(
-        modalidad_sesiones, sesiones_rotacion
+        modalidad_sesiones, sesiones_rotacion, grupo=grupo_id_desde_clave(username) is not None
     )
 
     with _LOCK, conectar() as conn:
+        grupo_id = _validar_destino_programacion(conn, chat_id, username)
         conn.execute(
             """
             INSERT INTO programaciones
@@ -1079,6 +1123,11 @@ def guardar_programacion_intervalo(
                 json.dumps(sesiones, ensure_ascii=False),
             ),
         )
+        conn.execute("UPDATE programaciones SET grupo_id = ? WHERE chat_id = ? AND username = ?",
+                     (grupo_id, int(chat_id), str(username).lower()))
+        if grupo_id is not None:
+            conn.execute("DELETE FROM rotaciones_programacion_grupo WHERE chat_id = ? AND grupo_id = ?",
+                         (int(chat_id), grupo_id))
         conn.commit()
 
 
@@ -1097,9 +1146,11 @@ def _normalizar_sesiones_rotacion(sesiones) -> list[str]:
     return resultado
 
 
-def _validar_modalidad_sesiones(modalidad, sesiones) -> tuple[str, list[str]]:
+def _validar_modalidad_sesiones(modalidad, sesiones, *, grupo=False) -> tuple[str, list[str]]:
     if not isinstance(modalidad, str) or modalidad not in {"normal", "variable"}:
         raise ValueError("modalidad_sesiones debe ser 'normal' o 'variable'")
+    if grupo:
+        return "normal", []
     if modalidad == "normal":
         return modalidad, []
     sesiones = _normalizar_sesiones_rotacion(sesiones)
@@ -1109,7 +1160,9 @@ def _validar_modalidad_sesiones(modalidad, sesiones) -> tuple[str, list[str]]:
 
 
 def modalidad_sesiones_de(row) -> str:
-    """Una fila de una versión anterior sigue usando su sesión preferida."""
+    """Una fila anterior y los grupos siempre usan su sesión preferida."""
+    if grupo_id_programacion(row) is not None:
+        return "normal"
     try:
         valor = row["modalidad_sesiones"]
     except (KeyError, IndexError, TypeError):
@@ -1398,7 +1451,6 @@ def notificacion_activada(
             )
         )
     except Exception:
-        # Compatibilidad defensiva con registros/versiones viejas.
         return True
 
 
@@ -1454,6 +1506,10 @@ def eliminar_programacion(
 ) -> None:
 
     with _LOCK, conectar() as conn:
+        grupo_id = grupo_id_desde_clave(username)
+        if grupo_id is not None:
+            conn.execute("DELETE FROM rotaciones_programacion_grupo WHERE chat_id = ? AND grupo_id = ?",
+                         (int(chat_id), grupo_id))
         conn.execute(
             """
             DELETE FROM programaciones
@@ -1468,9 +1524,6 @@ def eliminar_programacion(
         conn.commit()
 
 
-# ============================================================
-# MULTIMEDIA DE TELEGRAM
-# ============================================================
 
 def registrar_multimedia_telegram(
     chat_id: int,
@@ -1604,8 +1657,6 @@ def eliminar_registros_multimedia_telegram(
             parametros,
         )
 
-        # Si BORRAR MULTIMEDIA ya quitó esos mensajes de Telegram,
-        # tampoco hace falta conservarlos como protegidos.
         conn.execute(
             f"""
             DELETE FROM multimedia_protegida_chat
@@ -1618,9 +1669,6 @@ def eliminar_registros_multimedia_telegram(
         conn.commit()
 
 
-# ============================================================
-# MENSAJES DE TEXTO REGISTRADOS
-# ============================================================
 
 def registrar_mensaje_chat_limpiable(
     chat_id: int,
@@ -1746,9 +1794,6 @@ def purgar_registros_chat_limpiables_vencidos(
         conn.commit()
 
 
-# ============================================================
-# MULTIMEDIA PROTEGIDA PARA "LIMPIAR CHAT"
-# ============================================================
 
 def registrar_multimedia_protegida_chat(
     chat_id: int,

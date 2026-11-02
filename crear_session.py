@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
-# StoryPulse v2.0
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
-
+"""Exportación manual; --cuenta crea un navegador y archivo independientes."""
 from __future__ import annotations
 
 import argparse
@@ -38,7 +40,6 @@ def _identidades(data, resultado: dict[str, str]) -> None:
 
 def _abrir_navegador(p, perfil: Path, navegador: str, *, perfil_exacto: bool = False):
     opciones = {
-        # Opciones básicas compartidas por los perfiles independientes.
         "headless": False,
         "viewport": {"width": 1400, "height": 900},
     }
@@ -54,7 +55,6 @@ def _abrir_navegador(p, perfil: Path, navegador: str, *, perfil_exacto: bool = F
                 raise RuntimeError("No se pudo abrir el perfil de Edge seleccionado. Cerrá el navegador que lo esté usando y reintentá.")
             print("No se pudo iniciar Edge. Se intentará Chromium con un perfil independiente.")
             navegador = "chromium"
-    # Mantener separados los perfiles de motores distintos; no borrar el anterior.
     if not perfil_exacto:
         perfil = perfil.with_name(perfil.name + "_" + navegador)
     if navegador == "chrome":
@@ -88,8 +88,6 @@ def _esperar_inicio_manual(page, context, timeout_seconds: int = 600) -> list[di
                     and cookie and not formulario):
                 estado = "autenticada"
 
-        # Un sessionid puede existir aunque el CAPTCHA o el doble factor sigan pendientes.
-        # Esperar una página normal estable antes de sustituir el archivo anterior.
         if estado == "autenticada":
             ahora = time.monotonic()
             if cookie != cookie_anterior or estable_desde is None:
@@ -106,7 +104,6 @@ def _esperar_inicio_manual(page, context, timeout_seconds: int = 600) -> list[di
                 else:
                     print("Esperando el inicio de sesión. Usá el navegador; no hace falta presionar ENTER.")
                 aviso_anterior = estado
-        # Igual que en el creador anterior: las esperas de Playwright despachan eventos.
         page.wait_for_timeout(500)
     raise RuntimeError("No terminó el inicio de sesión o la verificación dentro del tiempo disponible. "
                        "No se reemplazó el JSON anterior. Podés ampliar el tiempo con --espera 1200.")
@@ -137,6 +134,8 @@ def main() -> None:
     parser.add_argument("--perfil", type=Path, help="Perfil de navegador existente; se utiliza esa carpeta exacta.")
     parser.add_argument("--archivo-sesion", type=Path, help="JSON exacto a renovar, aunque su nombre sea un alias.")
     parser.add_argument("--usuario-id", help="ID de Instagram de la sesión anterior, para confirmar que se renovó la misma cuenta.")
+    parser.add_argument("--subida-automatica", action="store_true",
+                        help="Indicar que el controlador subirá la sesión al VPS al terminar.")
     args = parser.parse_args()
     cuenta = args.cuenta.strip().lstrip("@").lower() if args.cuenta else None
     if cuenta and not re.fullmatch(r"[a-z0-9._]{1,30}", cuenta):
@@ -189,7 +188,6 @@ def main() -> None:
                 codigo = match.group(0) if match else "error de red"
                 if "ERR_ABORTED" in codigo:
                     return
-                # Nunca mostrar parámetros de autenticación/reCAPTCHA ni cookies.
                 print(f"⚠️ No se pudo cargar un recurso de {url.hostname or 'la página'}: {codigo}")
 
             def recibir_solicitud_terminada(request):
@@ -201,7 +199,6 @@ def main() -> None:
                 except Exception:
                     pass
 
-            # Leer cuerpos terminados evita esperar una descarga dentro de un evento response.
             page.on("requestfinished", recibir_solicitud_terminada)
             page.on("requestfailed", fallo_solicitud)
             try:
@@ -221,8 +218,11 @@ def main() -> None:
             _guardar_sesion_verificada(context, sesion)
             registrar_sesion(sesion.id, sesion.username, sesion.archivo)
             print(f"✅ SESIÓN EXPORTADA: {state}")
-            print("Copiá el archivo y sesiones_instagram.json al VPS conservando sus carpetas.")
-            print("Para agregar otra cuenta, ejecutá: python crear_session.py --cuenta OTRO_USERNAME")
+            if args.subida_automatica:
+                print("Sesión guardada. Se cierra el navegador y continúa la subida automática al VPS.")
+            else:
+                print("Copiá el archivo y sesiones_instagram.json al VPS conservando sus carpetas.")
+                print("Para agregar otra cuenta, ejecutá: python crear_session.py --cuenta OTRO_USERNAME")
         finally:
             context.close()
 

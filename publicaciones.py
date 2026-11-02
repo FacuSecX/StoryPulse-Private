@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
-# StoryPulse v2.1
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
+"""
+StoryPulse Web Private - publicaciones de perfil vía Instagram Web GraphQL.
 
-guardarse correctamente.
+Diseño conservador:
+  - reutiliza instagram_state.json;
+  - no abre publicaciones individuales;
+  - obtiene el primer lote por GraphQL;
+  - cuando el perfil necesita más páginas, deja que Instagram Web genere
+    su propia paginación mediante scroll y captura únicamente las respuestas
+    del timeline del usuario;
+  - en la primera sincronización recorre el historial disponible completo;
+  - después usa la antirepetición para detenerse al alcanzar contenido conocido;
+  - filtra por Post ID antes de descargar desde CDN;
+  - guarda imágenes como JPG y videos como MP4;
+  - registra antirepetición persistente en SQLite sólo cuando el post
+    terminó de guardarse correctamente.
 """
 
 from __future__ import annotations
@@ -17,7 +33,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -25,7 +41,8 @@ from PIL import Image
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 import database as db
-from history import comprobar_perfil_accesible
+from media_cdn import ErrorLimiteCDN, solicitar_archivo_cdn
+from history import comprobar_perfil_accesible, _datos_json_respuesta_recibida
 from instagram_sessions import (
     ejecutar_con_sesiones, obtener_ruta_sesion, guardar_estado_contexto,
     usar_playwright_sincronico,
@@ -46,16 +63,11 @@ PROFILE_DOC_ID = os.getenv(
     "8759034877476257",
 ).strip()
 
-# Lote por página. 24 mantiene pocas consultas sin pedir lotes excesivos.
 PROFILE_COUNT = int(
     os.getenv("INSTAGRAM_PUBLICATIONS_COUNT", "24")
 )
 PROFILE_COUNT = max(1, min(PROFILE_COUNT, 24))
 
-# La primera consulta sigue siendo directa y compacta. Para perfiles grandes,
-# la continuación se hace usando el scroll real de Instagram Web. Esto evita
-# depender de la posición interna del cursor de una consulta privada que puede
-# cambiar sin aviso.
 MAX_SCROLL_ROUNDS = int(
     os.getenv("INSTAGRAM_PUBLICATIONS_MAX_SCROLLS", "120")
 )
@@ -137,7 +149,6 @@ def construir_profile_url(
         "latest_reel_media": True,
     }
 
-    # El cursor pertenece al input `data` de la conexión timeline XDT.
     if cursor:
         data_variables["after"] = str(cursor)
 
@@ -262,7 +273,6 @@ def encontrar_conexion_publicaciones(
     Conservamos page_info porque es imprescindible para recorrer perfiles
     con más publicaciones que las que caben en el primer lote.
     """
-    # Forma clásica.
     for obj in iter_dicts(data):
         conexion = obj.get(
             "edge_owner_to_timeline_media"
@@ -280,7 +290,6 @@ def encontrar_conexion_publicaciones(
                 "edge_owner_to_timeline_media",
             )
 
-    # Forma XDT usada actualmente por el proyecto.
     for obj in iter_dicts(data):
         for clave, valor in obj.items():
             clave_baja = str(clave).lower()
@@ -305,7 +314,6 @@ def encontrar_conexion_publicaciones(
                     str(clave),
                 )
 
-    # Respaldo defensivo.
     for obj in iter_dicts(data):
         nodes = extraer_edges(obj)
         if nodes:
@@ -333,8 +341,6 @@ def _entero_publicaciones(valor: Any) -> int | None:
     if not texto:
         return None
 
-    # Para contadores completos del perfil Instagram suele devolver enteros.
-    # También aceptamos separadores de miles visibles en la interfaz.
     if re.fullmatch(r"[0-9][0-9.,]*", texto):
         limpio = texto.replace(".", "").replace(",", "")
         try:
@@ -359,7 +365,6 @@ def extraer_total_publicaciones(data: dict[str, Any]) -> int | None:
             if total is not None:
                 candidatos.append(total)
 
-        # Respuestas XDT/API de perfil suelen incluir media_count.
         total_media = _entero_publicaciones(obj.get("media_count"))
         if total_media is not None:
             candidatos.append(total_media)
@@ -418,9 +423,6 @@ def _node_pertenece_al_usuario(
 ) -> bool:
     propietario = _username_del_node(node)
     if propietario is None:
-        # Algunas conexiones del timeline omiten el propietario en cada node.
-        # Como sólo llamamos esta función sobre conexiones específicas del
-        # timeline del perfil, la ausencia no invalida el elemento.
         return True
     return propietario == username.lower()
 
@@ -435,9 +437,6 @@ def _deduplicar_nodes(
     for node in nodes:
         if not node_parece_publicacion(node):
             continue
-        # La conexión ya fue identificada como timeline del perfil solicitado.
-        # No filtramos por node.user porque una publicación colaborativa puede
-        # pertenecer al grid del perfil aunque el autor principal sea otra cuenta.
         post_id = texto_id(node)
         if not post_id or post_id in vistos:
             continue
@@ -489,8 +488,6 @@ def extraer_nodos_timeline_navegador(
                     item for item in items if isinstance(item, dict)
                 )
 
-    # Algunas cargas infinitas usan una respuesta REST /feed/user/... con
-    # `items` en vez de una conexión GraphQL edges/node.
     if "/feed/user" in url_baja or "user_timeline" in url_baja:
         for obj in iter_dicts(data):
             items = obj.get("items")
@@ -547,53 +544,45 @@ def descubrir_publicaciones_por_scroll(
                 }
             )
         except Exception:
-            # El progreso es informativo: nunca debe interrumpir la descarga.
             pass
 
     def procesar_response(response) -> None:
         nonlocal respuestas_timeline, encontro_conocido, total_detectado
 
         url = str(response.url)
-        url_baja = url.lower()
-        if "instagram.com" not in url_baja:
+        parsed = urlsplit(url)
+        path = parsed.path.rstrip('/').lower()
+        if parsed.hostname not in ("instagram.com", "www.instagram.com", "i.instagram.com"):
             return
         if not (
-            "/graphql/query" in url_baja
-            or "/api/v1/feed/user" in url_baja
-            or "user_timeline" in url_baja
+            path in ("/graphql/query", "/api/graphql")
+            or path.startswith("/api/v1/feed/user")
+            or "user_timeline" in path
         ):
             return
 
         try:
-            # El listener registra el fallo; el bucle lo propaga fuera del callback.
             validar_respuesta_instagram(page, response, "paginar publicaciones")
-            data = response.json()
-            validar_datos_instagram(data)
+            documentos = _datos_json_respuesta_recibida(response)
+            for documento in documentos:validar_datos_instagram(documento)
         except (ErrorSesionInstagram, PerfilNoEncontrado) as error:
             errores_sesion.append(error)
             return
         except Exception:
             return
 
-        if not isinstance(data, dict):
-            return
-
-        nodes = extraer_nodos_timeline_navegador(
-            data,
-            url,
-            username,
-        )
-        if not nodes:
-            return
-
+        nodes = []
+        for data in documentos:
+            if not isinstance(data, dict):continue
+            nuevos = extraer_nodos_timeline_navegador(data, url, username)
+            nodes.extend(nuevos)
+            perfil_correcto = any(isinstance(obj.get('username'), str) and obj['username'].casefold() == username.casefold()
+                                 for obj in iter_dicts(data))
+            posible_total = extraer_total_publicaciones(data) if nuevos or perfil_correcto else None
+            if posible_total is not None:
+                total_detectado = posible_total if total_detectado is None else max(total_detectado, posible_total)
+        if not nodes:return
         respuestas_timeline += 1
-
-        posible_total = extraer_total_publicaciones(data)
-        if posible_total is not None:
-            if total_detectado is None:
-                total_detectado = posible_total
-            else:
-                total_detectado = max(total_detectado, posible_total)
 
         for node in nodes:
             post_id = texto_id(node)
@@ -670,7 +659,6 @@ def descubrir_publicaciones_por_scroll(
             except Exception:
                 altura_antes = altura_anterior
 
-            # Llegar al fondo es lo que dispara la carga infinita del perfil.
             page.evaluate(
                 """() => window.scrollTo(
                     0,
@@ -723,10 +711,6 @@ def descubrir_publicaciones_por_scroll(
                 total_vistos = len(
                     vistos_iniciales.union(capturados.keys())
                 )
-                # Si conocemos el contador del perfil, sólo afirmamos que
-                # llegamos al final cuando alcanzamos ese número. Si no hay
-                # contador disponible, varias rondas estables en el fondo son
-                # nuestra señal de finalización.
                 llego_al_final = (
                     total_detectado is None
                     or total_vistos >= total_detectado
@@ -918,9 +902,6 @@ def extraer_medios_publicacion(
             else extraer_imagen_url(hijo)
         )
 
-        # En el módulo definitivo no registramos un video como completo
-        # usando sólo su thumbnail. Si el timeline no trae la URL real,
-        # dejamos el post pendiente en vez de hacer una consulta extra.
         if not url:
             return []
 
@@ -1028,8 +1009,6 @@ def descargar_publicaciones(
     resultado = ejecutar_con_sesiones(username, lambda: _descargar_publicaciones_sesion(
         username, chat_id, progress_callback, parciales,
     ))
-    # SQLite evita repetir archivos ya descargados por una sesión anterior.
-    # También deben figurar como nuevos en el resumen de esta misma operación.
     guardadas_anteriores = tuple(post for parcial in parciales for post in parcial["guardadas"])
     nuevas_anteriores = len(guardadas_anteriores)
     return replace(resultado,
@@ -1074,9 +1053,6 @@ def _descargar_publicaciones_sesion(
         chat_id,
         username,
     )
-    # Snapshot de lo que existía ANTES de esta ejecución. Es importante para
-    # el corte incremental: los posts que acabamos de descargar en el primer
-    # lote no deben confundirse con contenido histórico ya conocido.
     conocidos_antes_de_ejecutar = set(conocidos)
 
     historial_ya_completo = db.publicaciones_historial_completo(
@@ -1095,7 +1071,6 @@ def _descargar_publicaciones_sesion(
     total_perfil: int | None = None
     guardadas: list[PublicacionGuardada] = []
 
-    # Deduplicación entre el primer lote y las respuestas producidas por scroll.
     vistos_en_esta_ejecucion: set[str] = set()
 
     def reportar_progreso(
@@ -1134,10 +1109,16 @@ def _descargar_publicaciones_sesion(
                 )
             progress_callback(datos)
         except Exception:
-            # El progreso es informativo: nunca debe interrumpir la descarga.
             pass
 
     reportar_progreso("iniciando")
+
+    def reportar_cdn(datos: dict[str, Any]) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(datos)
+            except Exception:
+                pass
 
     with usar_playwright_sincronico(sync_playwright) as p:
         browser = p.chromium.launch(headless=True)
@@ -1195,7 +1176,8 @@ def _descargar_publicaciones_sesion(
 
                 try:
                     for medio in medios:
-                        respuesta_media = context.request.get(
+                        respuesta_media = solicitar_archivo_cdn(
+                            context.request,
                             medio.url,
                             headers={
                                 "Referer": (
@@ -1203,14 +1185,19 @@ def _descargar_publicaciones_sesion(
                                     f"{username}/"
                                 ),
                             },
-                            timeout=60000,
+                            progress_callback=reportar_cdn,
                         )
-
-                        if not respuesta_media.ok:
-                            raise ErrorConsultaInstagram(
-                                "CDN de Instagram respondió "
-                                f"HTTP {respuesta_media.status}."
-                            )
+                        try:
+                            if "json" in respuesta_media.headers.get("content-type", "").lower():
+                                validar_datos_instagram(respuesta_media.json())
+                            if not respuesta_media.ok:
+                                raise ErrorConsultaInstagram(
+                                    "CDN de Instagram respondió "
+                                    f"HTTP {respuesta_media.status}."
+                                )
+                            contenido = respuesta_media.body()
+                        finally:
+                            respuesta_media.dispose()
 
                         sufijo = ".mp4" if medio.es_video else ".jpg"
                         temporal = carpeta / (
@@ -1219,7 +1206,6 @@ def _descargar_publicaciones_sesion(
                         )
                         temporal.unlink(missing_ok=True)
 
-                        contenido = respuesta_media.body()
                         if medio.es_video:
                             temporal.write_bytes(contenido)
                         else:
@@ -1269,6 +1255,10 @@ def _descargar_publicaciones_sesion(
                     )
                     reportar_progreso("procesando")
 
+                except (ErrorLimiteCDN, ErrorSesionInstagram, ErrorConsultaInstagram, PlaywrightTimeoutError):
+                    for temporal in temporales:
+                        temporal.unlink(missing_ok=True)
+                    raise
                 except Exception:
                     for temporal in temporales:
                         try:
@@ -1282,9 +1272,6 @@ def _descargar_publicaciones_sesion(
             return conocidos_lote, nuevos_lote
 
         try:
-            # ------------------------------------------------------------
-            # 1) PRIMER LOTE: consulta directa, rápida y conocida.
-            # ------------------------------------------------------------
             page = context.new_page()
             response = page.goto(
                 construir_profile_url(username),
@@ -1295,13 +1282,28 @@ def _descargar_publicaciones_sesion(
 
             validar_respuesta_instagram(page, response, f"consultar publicaciones de @{username}")
 
-            data = leer_json_respuesta(page, response)
-            nodes, page_info, _ruta = encontrar_conexion_publicaciones(data)
-            total_perfil = extraer_total_publicaciones(data)
+            recorrido_inicial = None
+            try:
+                data = leer_json_respuesta(page, response)
+            except ErrorConsultaInstagram:
+                if int(response.status) != 200 or "html" not in response.headers.get("content-type", "").lower():
+                    raise
+                comprobar_perfil_accesible(username, sin_historias=True)
+                recorrido_inicial = descubrir_publicaciones_por_scroll(
+                    context, username, vistos_iniciales=set(),
+                    conocidos=conocidos_antes_de_ejecutar,
+                    historial_ya_completo=historial_ya_completo,
+                    total_objetivo=None,
+                )
+                nodes, respuestas_iniciales, _, _, total_perfil = recorrido_inicial
+                consultas_graphql += respuestas_iniciales
+                page_info = None
+            else:
+                nodes, page_info, _ruta = encontrar_conexion_publicaciones(data)
+                total_perfil = extraer_total_publicaciones(data)
             reportar_progreso("leyendo_perfil")
 
             if not nodes:
-                # No marcar completo un perfil privado que esta cuenta no puede ver.
                 comprobar_perfil_accesible(username)
                 if total_perfil != 0:
                     raise ErrorConsultaInstagram(
@@ -1317,11 +1319,15 @@ def _descargar_publicaciones_sesion(
                 and page_info.get("has_next_page")
             )
 
-            if not nodes:
+            if recorrido_inicial is not None:
+                _, _, final_inicial, conocido_inicial, _ = recorrido_inicial
+                corte_por_antirepeticion = bool(historial_ya_completo and conocido_inicial)
+                llego_al_final = bool(final_inicial)
+                if total_perfil is not None:
+                    llego_al_final = len(vistos_en_esta_ejecucion) >= total_perfil
+            elif not nodes:
                 llego_al_final = True
             elif historial_ya_completo and conocidos_primero > 0:
-                # Uso diario: ya tocamos el historial conocido en el lote
-                # reciente, así que no hay motivo para recorrer el perfil.
                 corte_por_antirepeticion = True
             else:
                 faltan_segun_total = (
@@ -1330,9 +1336,6 @@ def _descargar_publicaciones_sesion(
                 )
 
                 if has_next or faltan_segun_total:
-                    # ----------------------------------------------------
-                    # 2) CONTINUACIÓN: paginación REAL de Instagram Web.
-                    # ----------------------------------------------------
                     reportar_progreso("recorriendo")
 
                     def progreso_scroll(datos: dict[str, Any]) -> None:
@@ -1380,7 +1383,6 @@ def _descargar_publicaciones_sesion(
                     elif final_scroll:
                         llego_al_final = True
 
-                    # Si conocemos el total, éste manda sobre la señal de scroll.
                     if total_perfil is not None:
                         llego_al_final = (
                             len(vistos_en_esta_ejecucion) >= total_perfil
@@ -1390,10 +1392,6 @@ def _descargar_publicaciones_sesion(
 
             reportar_progreso("finalizando")
 
-            # Un perfil ya sincronizado conserva ese estado cuando la ejecución
-            # corta por antirepetición. Para una primera sincronización, sólo lo
-            # marcamos completo si alcanzamos el final y no quedó ningún post
-            # fallido/pendiente.
             if llego_al_final and fallidas == 0:
                 db.marcar_publicaciones_historial_completo(
                     chat_id,
@@ -1401,18 +1399,15 @@ def _descargar_publicaciones_sesion(
                 )
                 historial_ya_completo = True
             elif not historial_ya_completo:
-                # Mantener explícitamente "incompleto" para que una ejecución
-                # futura vuelva a intentar recorrer las páginas faltantes.
                 historial_ya_completo = False
 
             reportar_progreso("terminado")
 
-        except (ErrorSesionInstagram, ErrorConsultaInstagram, PerfilPrivado,
+        except (ErrorLimiteCDN, ErrorSesionInstagram, ErrorConsultaInstagram, PerfilPrivado,
                 PerfilNoEncontrado, PlaywrightTimeoutError):
             parciales.append({"guardadas": tuple(guardadas), "consultas": consultas_graphql})
             raise
         finally:
-            # No sobrescribir una sesión válida con cookies de una respuesta fallida.
             context.close()
             browser.close()
 

@@ -1,8 +1,15 @@
-# StoryPulse v2.1
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
 from __future__ import annotations
 
+from job_fallback import scoped_operation
+from contextvars import ContextVar
+from navigation_intents import propose_intents
+from navigation_ui import NavigationManager, NavigationView, StaleMenu
 import asyncio
 import html
 import json
@@ -38,6 +45,16 @@ from telegram.ext import (
 )
 
 import database as db
+import storypulse_backups as backups
+from media_cdn import ErrorLimiteCDN, aviso_espera_cdn
+from telegram_notices import (
+    AVISO_TTL_SEGUNDOS as AVISO_BORRADO_SEGUNDOS, PREFIX as AVISO_JOB_PREFIX,
+    programar_borrado_aviso, cancelar_borrado_aviso,
+    borrar_aviso_programado as borrar_aviso_temporal,
+)
+from batch_controls import ControlLote, LoteDetenido, usar_lote, comprobar_lote_no_detenido
+from session_associations import sincronizar_asociaciones, sesion_para_reintentar_asociaciones
+from story_download_modes import MODOS_HISTORIAS, ResultadoRevision
 from history import (
     PerfilNoEncontrado,
     PerfilPrivado,
@@ -60,6 +77,9 @@ from instagram_sessions import (
     ConfiguracionSesionesError, obtener_vinculo, cambiar_sesion_preferida,
     verificar_accesos_perfil, ejecutar_con_sesiones, sesion_actual,
     listar_sesiones_nuevas, actualizar_accesos_sesion,
+    usar_solo_sesiones_asociadas, SinSesionAsociadaDisponible,
+    pausar_sesion, reanudar_sesion, estado_pausa_sesion,
+    reanudar_pausas_vencidas, listar_pausas_sesiones,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -73,7 +93,7 @@ HISTORYS_DIR = Path(
 
 PANEL_URL = os.getenv(
     "STORYPULSE_PANEL_URL",
-    "https://example.com/",
+    "",
 ).strip()
 TZ = ZoneInfo(
     os.getenv(
@@ -96,6 +116,8 @@ IG_LOCK = asyncio.Lock()
 STORY_PROCESS_LOCK = asyncio.Lock()
 DESTACADAS_REVIEW_LOCK = asyncio.Lock()
 LIMPIEZAS_CHAT_EN_CURSO: set[int] = set()
+GRUPOS_PROGRAMADOS_EN_CURSO: set[tuple[int, int]] = set()
+LOTES_EN_CURSO: dict[str, ControlLote] = {}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -290,8 +312,6 @@ def _comprobar_sesion_web_real() -> dict[str, object]:
     except (OSError, ValueError):
         pass
 
-    # No buscar palabras sueltas en las publicaciones: una descripción puede
-    # mencionar CAPTCHA o challenge sin que la sesión tenga ningún problema.
     comprobar_dom = r"""() => {
         const visible = el => !!el && el.getClientRects().length > 0 &&
             getComputedStyle(el).visibility !== 'hidden';
@@ -327,9 +347,6 @@ def _comprobar_sesion_web_real() -> dict[str, object]:
             page = context.new_page()
 
             def procesar_response(response) -> None:
-                # Respuestas opcionales fallidas no invalidan un feed visible.
-                # Se leen datos ya recibidos para identificar la cuenta; no se
-                # hacen consultas adicionales de Stories ni de publicaciones.
                 try:
                     if not re.match(r"https://(?:[a-z0-9-]+\.)?instagram\.com/", response.url, re.I):
                         return
@@ -388,14 +405,10 @@ def _comprobar_sesion_web_real() -> dict[str, object]:
                     dom.get("publicaciones") or dom.get("historias") or dom.get("feed_vacio")
                 ))
                 alertas = "\n".join(str(item).casefold() for item in dom.get("alertas", []))
-                # Un aviso explícito de fallo del feed invalida una carga
-                # parcial, aunque ya haya publicaciones renderizadas.
                 if any(indicador in alertas for indicador in (
                     "couldn't refresh feed", "couldn’t refresh feed", "no se pudo actualizar el feed",
                 )):
                     raise RuntimeError("Instagram mostró un error y no cargó el feed normalmente.")
-                # La portada debe mostrar contenido además de navegación: un
-                # HTTP 200 o la presencia de cookies por sí solos no bastan.
                 if feed_visible:
                     if not usernames:
                         try:
@@ -447,34 +460,44 @@ def _tipo_error_estado_feed(error: Exception) -> str:
 
 
 def _estado_sesiones_feed(progress_callback=None, detener=None) -> list[dict[str, object]]:
-    """Diagnóstico al pulsar Estado, independiente del historial de descargas."""
-    resultados: list[dict[str, object]] = []
-    sesiones = listar_sesiones()
+    """Comprobar las activas; una pausa nunca provoca consultas de diagnóstico."""
+    resultados = []
+    locales = {fila['id']: fila for fila in estado_sesiones_local()}
+    sesiones = listar_sesiones(incluir_deshabilitadas=True)
     for indice, sesion in enumerate(sesiones, 1):
         if detener is not None and detener.is_set():
             break
-        base = {"id": sesion.id, "username": sesion.username, "etiqueta": sesion.etiqueta}
+        base = {'id': sesion.id, 'username': sesion.username, 'etiqueta': sesion.etiqueta}
         if progress_callback:
-            progress_callback({"actual": base, "procesadas": indice - 1, "total": len(sesiones)})
-        try:
-            # No consultar _indisponibilidad ni registrar éxitos/errores aquí:
-            # un error histórico no determina este diagnóstico del feed.
-            with usar_sesion(sesion):
-                remoto = _comprobar_sesion_web_real()
-            if remoto.get("ok") is not True:
-                raise RuntimeError("No se pudo confirmar el feed autenticado.")
-            resultado = {
-                **base, "disponible": True, "ultimo_error_tipo": None,
-                "detalle": "Feed autenticado visible; sesión correcta.", "remoto": remoto,
-            }
-        except Exception as error:
-            resultado = {
-                **base, "disponible": False, "ultimo_error_tipo": _tipo_error_estado_feed(error),
-                "detalle": str(error) or "El feed no se pudo comprobar.",
-            }
+            progress_callback({'actual': base, 'procesadas': indice-1, 'total': len(sesiones)})
+        local = locales[sesion.id]
+        pausa = estado_pausa_sesion(sesion.id)
+        if pausa:
+            detalle = texto_pausa_sesion(pausa)
+            if local.get('ultimo_error_tipo') == 'verificacion':
+                detalle += '\nÚltima comprobación: CAPTCHA/verificación pendiente.'
+            resultado = {**base, 'pausada': True, 'disponible': False,
+                         'reanudar_en': pausa['reanudar_en'], 'detalle': detalle}
+        elif not local['habilitada']:
+            resultado = {**base, 'pausada': False, 'disponible': False,
+                         'ultimo_error_tipo': 'deshabilitada', 'detalle': local['detalle']}
+        else:
+            try:
+                with usar_sesion(sesion):
+                    remoto = _comprobar_sesion_web_real()
+                if remoto.get('ok') is not True:
+                    raise RuntimeError('No se pudo confirmar el feed autenticado.')
+                resultado = {**base, 'pausada': False, 'disponible': True,
+                             'ultimo_error_tipo': None, 'detalle': 'Feed autenticado visible; sesión correcta.',
+                             'remoto': remoto}
+            except Exception as error:
+                pausa = estado_pausa_sesion(sesion.id)
+                resultado = {**base, 'pausada': pausa is not None, 'disponible': False,
+                             'ultimo_error_tipo': _tipo_error_estado_feed(error),
+                             'detalle': texto_pausa_sesion(pausa) if pausa else str(error) or 'El feed no se pudo comprobar.'}
         resultados.append(resultado)
         if progress_callback:
-            progress_callback({"actual": base, "procesadas": indice, "total": len(sesiones)})
+            progress_callback({'actual': base, 'procesadas': indice, 'total': len(sesiones)})
     return resultados
 
 
@@ -497,16 +520,24 @@ def registrar_mensaje_limpiable(
 async def enviar_texto_bot(
     context: ContextTypes.DEFAULT_TYPE,
     *args,
+    borrar_en: int | None = None,
+    temporal: bool = True,
     **kwargs,
 ):
     """
-    Envía texto y registra su message_id para LIMPIAR CHAT.
+    Envía avisos de texto, registra LIMPIAR CHAT y borra a los 60 segundos.
+    Los menús con botones y los textos temporal=False se conservan.
     Nunca se usa para fotos/videos.
     """
-    mensaje = await context.bot.send_message(
-        *args,
-        **kwargs,
-    )
+    if kwargs.get('reply_markup') is not None and not args:
+        opciones = dict(kwargs)
+        chat_id = int(opciones.pop('chat_id'))
+        texto = opciones.pop('text')
+        mensaje = await obtener_navegacion(context).send(chat_id, texto, **opciones)
+        if mensaje is None:
+            return None
+    else:
+        mensaje = await context.bot.send_message(*args, **kwargs)
 
     try:
         registrar_mensaje_limpiable(
@@ -518,12 +549,56 @@ async def enviar_texto_bot(
             "No se pudo registrar texto saliente de Telegram."
         )
 
+    if temporal or borrar_en is not None:
+        programar_borrado_aviso(context, mensaje,
+            segundos=borrar_en if borrar_en is not None else AVISO_BORRADO_SEGUNDOS)
+
     return mensaje
+
+
+async def enviar_menu_al_final(
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    texto: str,
+    **opciones,
+):
+    """Publica los controles debajo de los resultados y retira el menú anterior."""
+    if isinstance(query, NavigationView):
+        return await query.send(texto, move_to_end=True, disable_notification=True, **opciones)
+    anterior = query.message
+    chat_id = int(anterior.chat.id) if anterior is not None else AUTHORIZED_CHAT_ID
+    nuevo = await enviar_texto_bot(
+        context, chat_id=chat_id, text=texto, temporal=False,
+        disable_notification=True, **opciones,
+    )
+    if anterior is None:
+        return nuevo
+
+    if getattr(anterior, "text", None) is not None:
+        try:
+            borrado = await context.bot.delete_message(
+                chat_id=chat_id, message_id=int(anterior.message_id),
+            )
+        except TelegramError as error:
+            logger.warning("No se pudo retirar el menú anterior: %s", error)
+        else:
+            if borrado:
+                try:
+                    db.eliminar_registros_chat_limpiables(chat_id, [int(anterior.message_id)])
+                except Exception:
+                    logger.exception("No se pudo retirar el registro del menú anterior.")
+                return nuevo
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError as error:
+        logger.warning("No se pudieron retirar los botones del menú anterior: %s", error)
+    return nuevo
 
 
 async def responder_texto(
     update: Update,
     *args,
+    context=None,
     **kwargs,
 ):
     """
@@ -534,10 +609,23 @@ async def responder_texto(
     if mensaje_origen is None:
         return None
 
-    mensaje = await mensaje_origen.reply_text(
-        *args,
-        **kwargs,
-    )
+    context = context or NAVIGATION_CONTEXT.get()
+    if context is None:
+        mensaje = await mensaje_origen.reply_text(*args, **kwargs)
+    else:
+        manager = obtener_navegacion(context)
+        vista = manager.current_view(int(mensaje_origen.chat.id))
+        if vista is None:
+            vista = await manager.begin(int(mensaje_origen.chat.id), force_new=True)
+        texto = args[0] if args else kwargs.pop('text', '')
+        if len(args) > 1:
+            raise TypeError('responder_texto acepta un único texto')
+        if context.user_data.get(STATE) in {PAUSE_DURATION, PAUSE_DATE}:
+            mensaje = await vista.edit_message_text(texto, **kwargs)
+        else:
+            mensaje = await vista.send(texto, move_to_end=True, **kwargs)
+        if mensaje is None:
+            return None
 
     try:
         registrar_mensaje_limpiable(
@@ -612,7 +700,6 @@ async def borrar_textos_chat(
         except BadRequest as error:
             detalle = str(error).lower()
             if "message to delete not found" in detalle or "message not found" in detalle:
-                # Ya estaban borrados: no deben volver a intentarse.
                 pass
             elif any(texto in detalle for texto in (
                 "message can't be deleted", "message cannot be deleted", "48 hours",
@@ -633,7 +720,6 @@ async def borrar_textos_chat(
         for inicio in range(0, len(candidatos), 100):
             await procesar(candidatos[inicio:inicio + 100])
     except TelegramError as error:
-        # Conservar los registros pendientes para poder reintentar después.
         resultado["interrumpida"] = True
         logger.warning("LIMPIAR CHAT: se interrumpió el borrado chat_id=%s: %s", chat_id, error)
 
@@ -645,7 +731,7 @@ async def limpiar_chat_en_segundo_plano(
     context: ContextTypes.DEFAULT_TYPE,
     query,
     chat_id: int,
-    max_message_id: int,
+    message_id_estado: int,
 ) -> None:
     inicio = time.monotonic()
     try:
@@ -653,7 +739,7 @@ async def limpiar_chat_en_segundo_plano(
         recientes = await asyncio.to_thread(db.mensajes_chat_limpiables_recientes, chat_id, horas=48)
         candidatos = sorted({
             int(message_id) for message_id in recientes
-            if 0 < int(message_id) < max_message_id and int(message_id) not in protegidos
+            if 0 < int(message_id) != message_id_estado and int(message_id) not in protegidos
         }, reverse=True)
         resultado = await borrar_textos_chat(context.bot, chat_id, candidatos)
         await asyncio.to_thread(db.purgar_registros_chat_limpiables_vencidos, chat_id, horas=48)
@@ -669,13 +755,10 @@ async def limpiar_chat_en_segundo_plano(
         if resultado["pendientes"]:
             texto += f"\n⚠️ Quedaron {resultado['pendientes']} texto(s) pendientes. Podés reintentar la limpieza."
         texto += "\n\n📸 Las fotos y los videos quedaron intactos."
-        try:
-            await query.edit_message_text(
-                texto, parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Menú principal", callback_data="menu")]]),
-            )
-        except TelegramError:
-            await enviar_texto_bot(context, chat_id=chat_id, text=texto, parse_mode="HTML", disable_notification=True)
+        await enviar_menu_al_final(
+            context, query, texto, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Menú principal", callback_data="menu")]]),
+        )
         logger.info("LIMPIAR CHAT: chat_id=%s candidatos=%s resultado=%s duración=%.2fs",
                     chat_id, len(candidatos), resultado, time.monotonic() - inicio)
     finally:
@@ -693,9 +776,17 @@ def diagnosticar_error(error: Exception) -> tuple[str, str, str]:
     texto = str(error)
     bajo = texto.lower()
 
+    if isinstance(error, ErrorLimiteCDN) or ("cdn" in bajo and "429" in bajo):
+        return ("🚦", "LÍMITE DE DESCARGA DEL CDN (HTTP 429)",
+                "El CDN limitó la descarga de archivos. Se conserva lo ya guardado; "
+                "podés continuar más tarde y se omitirán los elementos registrados. "
+                "Este rechazo no indica que la sesión esté vencida.")
     if isinstance(error, ConfiguracionSesionesError):
         return ("📄", "CONFIGURACIÓN DE SESIONES", "Revisá sesiones_instagram.json y el registro de sesiones.")
     if isinstance(error, SesionesAgotadas):
+        if error.tipos and error.tipos <= {"consulta", "timeout"}:
+            return ("⚠️", "CONSULTA DE INSTAGRAM INCOMPLETA",
+                    "Instagram no permitió completar la consulta del perfil. Esto no confirma que la sesión esté vencida; revisá el detalle del error antes de renovarla.")
         return ("🔐", "NINGUNA SESIÓN DISPONIBLE",
                 "Revisá los archivos JSON y los últimos errores. CAPTCHA y login requieren renovación manual de la sesión afectada.")
     if isinstance(error, ErrorSesionInstagram) and error.tipo == "verificacion":
@@ -813,14 +904,12 @@ def mensaje_error_instagram(
 
     detalle = str(error).strip() or repr(error)
 
-    # Evitar que por accidente un token termine visible en Telegram.
     if BOT_TOKEN:
         detalle = detalle.replace(
             BOT_TOKEN,
             "[TOKEN OCULTO]",
         )
 
-    # El mensaje de Telegram no necesita un traceback completo.
     detalle = detalle[:1200]
 
     ahora = datetime.now(TZ).strftime(
@@ -1180,11 +1269,119 @@ def menu_elegir_sesion_preferida(username: str, context, message_id=None) -> Inl
     return InlineKeyboardMarkup(filas)
 
 
+def modo_descarga_historias(cuenta: dict | None) -> str:
+    return 'portada' if cuenta and cuenta.get('modo_descarga_historias') == 'portada' else 'normal'
+
+
+def nombre_modo_historias(modo: str) -> str:
+    return 'Descarga Modo Portada 🖼️' if modo == 'portada' else 'Normal 🖼️ / 🎬'
+
+
+def cambiar_modo_historias(username: str, modo: str) -> bool:
+    if modo not in MODOS_HISTORIAS:
+        raise ValueError('Modo de descarga inválido.')
+    username = limpiar_username(username)
+    with CUENTAS_LOCK:
+        cuentas = cargar_cuentas()
+        encontradas = [c for c in cuentas if c['username'] == username]
+        if not encontradas:
+            return False
+        for cuenta in encontradas:
+            cuenta['modo_descarga_historias'] = modo
+        guardar_cuentas(cuentas)
+    return True
+
+
+def menu_perfiles_modo_historias(pagina: int = 0) -> InlineKeyboardMarkup:
+    cuentas = list({c['username']: c for c in cargar_cuentas()}.values())
+    paginas = max(1, (len(cuentas)+9)//10)
+    pagina = max(0, min(pagina, paginas-1))
+    botones = [boton_cuenta(
+        c, f"{'⭐ ' if c.get('destacada') is True else ''}{c['nombre']} · {'Portada 🖼️' if modo_descarga_historias(c) == 'portada' else 'Normal 🖼️ / 🎬'}",
+        callback_data=f"story_mode_profile:{c['username']}",
+    ) for c in cuentas[pagina*10:(pagina+1)*10]]
+    filas = [[boton] for boton in botones]
+    navegacion = []
+    if pagina:
+        navegacion.append(InlineKeyboardButton('‹ Anterior', callback_data=f'story_modes_page:{pagina-1}'))
+    if pagina+1 < paginas:
+        navegacion.append(InlineKeyboardButton('Siguiente ›', callback_data=f'story_modes_page:{pagina+1}'))
+    if navegacion:
+        filas.append(navegacion)
+    filas.append([InlineKeyboardButton('‹ Menú principal', callback_data='menu')])
+    return InlineKeyboardMarkup(filas)
+
+
+def menu_modo_historias(cuenta: dict) -> InlineKeyboardMarkup:
+    modo = modo_descarga_historias(cuenta)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(('✅ ' if modo == 'normal' else '')+nombre_modo_historias('normal'),
+                              callback_data=f"story_mode_set:normal:{cuenta['username']}")],
+        [InlineKeyboardButton(('✅ ' if modo == 'portada' else '')+nombre_modo_historias('portada'),
+                              callback_data=f"story_mode_set:portada:{cuenta['username']}")],
+        [InlineKeyboardButton('‹ Elegir otro perfil', callback_data='story_modes')],
+        [InlineKeyboardButton('‹ Menú principal', callback_data='menu')],
+    ])
+
+
+async def callback_modo_historias(context, query, data: str) -> bool:
+    if data == 'story_modes' or data.startswith('story_modes_page:'):
+        context.user_data.clear()
+        try:
+            pagina = int(data.split(':', 1)[1]) if ':' in data else 0
+        except ValueError:
+            pagina = 0
+        texto = ('🖼 <b>Modo de descarga de historias</b>\n\n'
+                 'Elegí un perfil para configurar su modo.\n'
+                 'Se aplica a revisiones manuales y programadas.')
+        if not cargar_cuentas():
+            texto = 'ℹ️ Primero agregá perfiles desde Gestionar cuentas.'
+        await query.edit_message_text(texto, parse_mode='HTML', reply_markup=menu_perfiles_modo_historias(pagina))
+        return True
+    if not data.startswith(('story_mode_profile:', 'story_mode_set:')):
+        return False
+    context.user_data.clear()
+    try:
+        if data.startswith('story_mode_set:'):
+            _, modo, username = data.split(':', 2)
+            if modo not in MODOS_HISTORIAS:
+                raise ValueError('Modo inválido.')
+        else:
+            username = data.split(':', 1)[1]
+            modo = None
+        username = limpiar_username(username)
+    except ValueError:
+        await query.edit_message_text('Selección inválida. Volvé a elegir el perfil.',
+                                      reply_markup=menu_perfiles_modo_historias())
+        return True
+    if modo is not None and not cambiar_modo_historias(username, modo):
+        cuenta = None
+    else:
+        cuenta = buscar_cuenta(username)
+    if cuenta is None:
+        await query.edit_message_text('Ese perfil ya no está disponible.', reply_markup=menu_perfiles_modo_historias())
+        return True
+    texto = (f"🖼 <b>{esc(cuenta['nombre'])}</b> (@{esc(username)})\n\n"
+             f"Modo actual: <b>{nombre_modo_historias(modo_descarga_historias(cuenta))}</b>\n\n"
+             '<b>Normal:</b> conserva cada historia como imagen o video.\n'
+             '<b>Portada:</b> guarda y envía un JPG estático de la mejor imagen disponible.\n\n'
+             'Esta preferencia se aplica únicamente a historias.')
+    if modo is not None:
+        texto = '✅ Preferencia guardada.\n\n'+texto
+    await query.edit_message_text(texto, parse_mode='HTML', reply_markup=menu_modo_historias(cuenta))
+    return True
+
+
+def descargar_historias_segun_modo(chat_id: int, username: str, user_id: int | None, modo: str):
+    if modo == 'portada':
+        return descargar_historias(
+            username, user_id, modo_descarga='portada',
+            omitir_historia=lambda story_pk: db.historia_ya_enviada(chat_id, username, story_pk),
+        )
+    return descargar_historias(username, user_id)
+
+
 def menu_principal() -> InlineKeyboardMarkup:
-    # Menú principal orientado al usuario: una opción por fila,
-    # textos en mayúsculas y estilos visuales fáciles de distinguir.
-    # Telegram solo permite fondos primary/azul, success/verde,
-    # danger/rojo o neutro; rosa y naranja se señalan con emoji.
     filas = [
         [
             InlineKeyboardButton(
@@ -1220,6 +1417,7 @@ def menu_principal() -> InlineKeyboardMarkup:
                 style="primary",
             )
         ],
+        [InlineKeyboardButton("🖼 MODO DE DESCARGA", callback_data="story_modes")],
         [
             InlineKeyboardButton(
                 "🩷 PROGRAMAR REVISIÓN",
@@ -1245,13 +1443,13 @@ def menu_principal() -> InlineKeyboardMarkup:
                 callback_data="status",
             )
         ],
-        [
-            InlineKeyboardButton(
+        *([
+            [InlineKeyboardButton(
                 "🌐 ABRIR PANEL STORYPULSE",
                 url=PANEL_URL,
                 style="primary",
-            )
-        ],
+            )]
+        ] if PANEL_URL else []),
         [
             InlineKeyboardButton(
                 "🗑 BORRAR MULTIMEDIA",
@@ -1259,6 +1457,7 @@ def menu_principal() -> InlineKeyboardMarkup:
                 style="danger",
             )
         ],
+        [InlineKeyboardButton("💾 BACKUPS", callback_data="backups_menu")],
         [
             InlineKeyboardButton(
                 "🧹 LIMPIAR CHAT",
@@ -1401,6 +1600,9 @@ def menu_gestion() -> InlineKeyboardMarkup:
                     callback_data="sessions_update",
                 )
             ],
+            [InlineKeyboardButton("🔄 Actualizar asociaciones", callback_data="associations_sync")],
+            [InlineKeyboardButton("♻️ Reintentar asociaciones pendientes", callback_data="associations_retry")],
+            [InlineKeyboardButton("⏸️ Pausar/reanudar sesiones", callback_data="sessions_pause")],
             [
                 InlineKeyboardButton(
                     "♻️ Reiniciar antirepetición",
@@ -1514,7 +1716,147 @@ def cuentas_disponibles_para_programar():
     ]
 
 
-def menu_modalidades_programacion() -> InlineKeyboardMarkup:
+def limpiar_destino_programacion(valor: str) -> str:
+    valor = str(valor).strip().lower()
+    return valor if db.grupo_id_desde_clave(valor) is not None else limpiar_username(valor)
+
+
+def menu_destinos_programacion() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Programaciones individuales", callback_data="schedules_individual")],
+        [InlineKeyboardButton("👥 Programaciones de grupos", callback_data="schedules_groups")],
+        [InlineKeyboardButton("📋 Ver programaciones", callback_data="sched_list")],
+        [InlineKeyboardButton("‹ Menú principal", callback_data="menu")],
+    ])
+
+
+def menu_grupos_programables(pagina: int = 0) -> InlineKeyboardMarkup:
+    grupos = db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID)
+    activas = usernames_con_programacion_activa()
+    grupos = [g for g in grupos if db.clave_programacion_grupo(g["id"]) not in activas]
+    paginas = max(1, (len(grupos) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    pagina = max(0, min(pagina, paginas - 1))
+    actuales = {c["username"] for c in cargar_cuentas()}
+    filas = [[InlineKeyboardButton(
+        f"👥 {g['nombre']} ({len(actuales.intersection(g['usuarios']))})",
+        callback_data=f"sched_target:{db.clave_programacion_grupo(g['id'])}")]
+        for g in grupos[pagina * GROUPS_PAGE_SIZE:(pagina + 1) * GROUPS_PAGE_SIZE]]
+    navegacion = []
+    if pagina > 0:
+        navegacion.append(InlineKeyboardButton("‹ Anterior", callback_data=f"schedules_groups_page:{pagina - 1}"))
+    if pagina + 1 < paginas:
+        navegacion.append(InlineKeyboardButton("Siguiente ›", callback_data=f"schedules_groups_page:{pagina + 1}"))
+    if navegacion:
+        filas.append(navegacion)
+    filas.extend([
+        [InlineKeyboardButton("📋 Ver programaciones", callback_data="sched_list")],
+        [InlineKeyboardButton("👥 Gestionar grupos", callback_data="groups_menu")],
+        [InlineKeyboardButton("‹ Volver", callback_data="schedules")],
+    ])
+    return InlineKeyboardMarkup(filas)
+
+
+def integrantes_programables(grupo: dict) -> list[str]:
+    actuales = {c["username"] for c in cargar_cuentas()}
+    return sorted(actuales.intersection(grupo["usuarios"]))
+
+
+def validar_destino_flujo(context) -> bool:
+    username = context.user_data.get(SCHED_USERNAME, "")
+    grupo_id = db.grupo_id_desde_clave(username)
+    if grupo_id is not None:
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id)
+        return grupo is not None and bool(integrantes_programables(grupo))
+    return buscar_cuenta(username) is not None
+
+
+async def callback_destinos_programacion(context, query, data: str) -> bool:
+    if data == "schedules":
+        context.user_data.clear()
+        await query.edit_message_text("⚙️ Programaciones\n\nElegí qué querés programar:",
+                                      reply_markup=menu_destinos_programacion())
+        return True
+    if data == "schedules_individual":
+        context.user_data.clear()
+        await query.edit_message_text("👤 Programaciones individuales\n\nElegí una cuenta. "
+                                      "Las que tienen una programación activa aparecen en Ver programaciones.",
+                                      reply_markup=menu_programaciones())
+        return True
+    if data == "schedules_groups" or data.startswith("schedules_groups_page:"):
+        context.user_data.clear()
+        try:
+            pagina = int(data.split(":", 1)[1]) if ":" in data else 0
+        except ValueError:
+            pagina = 0
+        texto = ("👥 Programaciones de grupos\n\nElegí un grupo. "
+                 "Los que ya tienen una programación activa aparecen en Ver programaciones.\n\n"
+                 "Se revisarán sus integrantes en secuencia.")
+        if not db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID):
+            texto = "ℹ️ Todavía no hay grupos. Crealos desde Gestionar grupos."
+        await query.edit_message_text(texto, reply_markup=menu_grupos_programables(pagina))
+        return True
+    if data.startswith("sched_target:"):
+        username = limpiar_destino_programacion(data.split(":", 1)[1])
+        grupo_id = db.grupo_id_desde_clave(username)
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id) if grupo_id else None
+        if (grupo_id and (grupo is None or not integrantes_programables(grupo))) or (
+                not grupo_id and buscar_cuenta(username) is None):
+            await query.edit_message_text("Ese destino ya no está disponible o no tiene perfiles agregados.",
+                                          reply_markup=menu_destinos_programacion())
+            return True
+        existente = db.obtener_programacion(AUTHORIZED_CHAT_ID, username)
+        if existente is not None and bool(existente["activa"]):
+            await query.edit_message_text(texto_detalle_programacion(existente), parse_mode="HTML",
+                                          reply_markup=menu_detalle_programacion(existente))
+            return True
+        context.user_data.clear()
+        context.user_data[SCHED_USERNAME] = username
+        if grupo_id is not None:
+            context.user_data[SCHED_MODALIDAD] = "normal"
+            await query.edit_message_text(
+                f"⏰ {grupo['nombre']}\n\n"
+                "Cada perfil usa su sesión preferida y sus respaldos con acceso.\n\n"
+                "¿Cómo querés programar las revisiones?",
+                reply_markup=menu_tipo_programacion(username),
+            )
+            return True
+        await query.edit_message_text(f"⚙️ {nombre_visible_programacion(username)}\n\nElegí la modalidad:",
+                                      reply_markup=menu_modalidades_programacion(username))
+        return True
+    if data.startswith(("sched:grupo-", "schedv:grupo-")):
+        username = limpiar_destino_programacion(data.split(":", 1)[1])
+        grupo_id = db.grupo_id_desde_clave(username)
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id) if grupo_id else None
+        if grupo is None or not integrantes_programables(grupo):
+            await query.edit_message_text("Ese grupo ya no existe o no tiene perfiles agregados.",
+                                          reply_markup=menu_grupos_programables())
+            return True
+        existente = db.obtener_programacion(AUTHORIZED_CHAT_ID, username)
+        if existente is not None and bool(existente["activa"]):
+            await query.edit_message_text(texto_detalle_programacion(existente), parse_mode="HTML",
+                                          reply_markup=menu_detalle_programacion(existente))
+            return True
+        context.user_data.clear()
+        context.user_data.update({SCHED_USERNAME: username, SCHED_MODALIDAD: "normal"})
+        await query.edit_message_text(
+            f"⏰ {grupo['nombre']}\n\n"
+            "Cada perfil usa su sesión preferida y sus respaldos con acceso.\n\n"
+            "¿Cómo querés programar las revisiones?",
+            reply_markup=menu_tipo_programacion(username),
+        )
+        return True
+    return False
+
+
+def menu_modalidades_programacion(username: str | None = None) -> InlineKeyboardMarkup:
+    if username is not None and db.grupo_id_desde_clave(username) is not None:
+        return menu_tipo_programacion(username)
+    if username is not None:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 Programación normal", callback_data=f"sched:{username}")],
+            [InlineKeyboardButton("🔄 Programación variable", callback_data=f"schedv:{username}")],
+            [InlineKeyboardButton("‹ Volver", callback_data="schedules_groups" if db.grupo_id_desde_clave(username) else "schedules_individual")],
+        ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Programaciones normales", callback_data="schedules_normal")],
         [InlineKeyboardButton("🔄 Programaciones variables", callback_data="schedules_variable")],
@@ -1523,7 +1865,7 @@ def menu_modalidades_programacion() -> InlineKeyboardMarkup:
     ])
 
 
-def menu_programaciones(modalidad: str = "normal") -> InlineKeyboardMarkup:
+def menu_programaciones(modalidad: str | None = None) -> InlineKeyboardMarkup:
     filas = []
     botones = []
 
@@ -1532,11 +1874,10 @@ def menu_programaciones(modalidad: str = "normal") -> InlineKeyboardMarkup:
             boton_cuenta(
                 cuenta,
                 f"⏰ {cuenta['nombre']}",
-                callback_data=f"{'schedv' if modalidad == 'variable' else 'sched'}:{cuenta['username']}",
+                callback_data=f"{'sched_target' if modalidad is None else ('schedv' if modalidad == 'variable' else 'sched')}:{cuenta['username']}",
             )
         )
 
-    # Cuentas disponibles en grilla de dos columnas.
     for posicion in range(
         0,
         len(botones),
@@ -1559,7 +1900,7 @@ def menu_programaciones(modalidad: str = "normal") -> InlineKeyboardMarkup:
     filas.append(
         [
             InlineKeyboardButton(
-                "‹ Elegir modalidad",
+                "‹ Volver",
                 callback_data="schedules",
             )
         ]
@@ -1573,6 +1914,10 @@ def nombre_visible_programacion(username: str) -> str:
     Devuelve el nombre amigable guardado en cuentas.json.
     Si la cuenta ya no está en la lista fija, usa @username.
     """
+    grupo_id = db.grupo_id_desde_clave(username)
+    if grupo_id is not None:
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id)
+        return "👥 " + grupo["nombre"] if grupo else "Grupo eliminado"
     cuenta = buscar_cuenta(
         username
     )
@@ -1601,8 +1946,6 @@ def menu_lista_programaciones(
     filas = []
     botones = []
 
-    # Ordenar por el nombre visible de la cuenta.
-    # casefold() evita diferencias entre mayúsculas/minúsculas.
     rows_ordenadas = sorted(
         rows,
         key=lambda row: (
@@ -1629,7 +1972,8 @@ def menu_lista_programaciones(
 
         botones.append(
             boton_cuenta(
-                buscar_cuenta(username) or {},
+                {} if db.grupo_id_desde_clave(username) is not None
+                else buscar_cuenta(username) or {},
                 f"{estado} {nombre}",
                 callback_data=(
                     f"sched_detail:{username}"
@@ -1637,7 +1981,6 @@ def menu_lista_programaciones(
             )
         )
 
-    # Grilla de dos columnas.
     for posicion in range(
         0,
         len(botones),
@@ -1688,7 +2031,17 @@ def texto_detalle_programacion(
         "",
     ]
 
-    if db.modalidad_sesiones_de(row) == "variable":
+    grupo_id = db.grupo_id_programacion(row)
+    if grupo_id is not None:
+        grupo = db.obtener_grupo_cuentas(int(row["chat_id"]), grupo_id)
+        miembros = integrantes_programables(grupo) if grupo else []
+        lineas = ["📋 <b>Programación de grupo</b>", "", f"Grupo: <b>{esc(nombre)}</b>",
+                  f"Perfiles: <b>{len(miembros)}</b>",
+                  " · ".join("@" + esc(u) for u in miembros),
+                  "Sesiones: preferida de cada perfil y sus respaldos con acceso.",
+                  "Revisión secuencial de los integrantes actuales.", ""]
+
+    if grupo_id is None and db.modalidad_sesiones_de(row) == "variable":
         ids = db.sesiones_rotacion_de(row)
         sesiones = listar_sesiones()
         nombres = nombres_sesiones(sesiones)
@@ -1851,6 +2204,9 @@ def menu_tipo_programacion(
     Permite elegir entre el sistema clásico de horarios fijos
     y la nueva modalidad de intervalos.
     """
+    if db.grupo_id_desde_clave(username) is not None:
+        modalidad = "normal"
+
     return InlineKeyboardMarkup(
         [
             [
@@ -1872,7 +2228,7 @@ def menu_tipo_programacion(
             [
                 InlineKeyboardButton(
                     "‹ Volver",
-                    callback_data=f"schedules_{modalidad}",
+                    callback_data="schedules_groups" if db.grupo_id_desde_clave(username) is not None else f"sched_target:{username}",
                 )
             ],
         ]
@@ -1886,6 +2242,9 @@ def menu_intervalos(
     """
     Intervalos disponibles: de 1 a 12 horas.
     """
+    if db.grupo_id_desde_clave(username) is not None:
+        modalidad = "normal"
+
     botones = []
 
     for horas in range(1, 13):
@@ -1932,6 +2291,8 @@ def menu_intervalos(
 
 
 def menu_cantidad(username: str, modalidad: str = "normal") -> InlineKeyboardMarkup:
+    if db.grupo_id_desde_clave(username) is not None:
+        modalidad = "normal"
     filas = []
 
     for n in range(1, 7):
@@ -1979,14 +2340,33 @@ def menu_destacadas() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(filas)
 
 
+def normalizar_callback_programacion_grupo(context, data: str) -> str:
+    """Los botones variables anteriores conservan el horario, con sesiones normales."""
+    comando, separador, resto = data.partition(":")
+    destino = resto.split(":", 1)[0]
+    if (separador and db.grupo_id_desde_clave(destino) is not None and comando in {
+            "schedv_mode_daily", "schedv_mode_interval", "schedv_count", "schedv_interval"}):
+        if context.user_data.get(SCHED_USERNAME) == destino:
+            context.user_data[SCHED_MODALIDAD] = "normal"
+            context.user_data[SCHED_SESIONES] = []
+            context.user_data[SCHED_SESIONES_ELEGIDAS] = []
+        return "sched" + comando[len("schedv"):] + ":" + resto
+    return data
+
+
 def conservar_flujo_programacion(context, username: str, modalidad: str) -> bool:
     """Cada botón lleva su modalidad; un flujo variable exige su comprobación."""
+    if db.grupo_id_desde_clave(username) is not None and (
+            context.user_data.get(SCHED_USERNAME) != username
+            or context.user_data.get(SCHED_MODALIDAD) != modalidad
+            or not validar_destino_flujo(context)):
+        return False
     sesiones = []
     elegidas = []
     if (context.user_data.get(SCHED_USERNAME) not in (None, username)
             or context.user_data.get(SCHED_MODALIDAD) not in (None, modalidad)):
         return False
-    if modalidad == "variable":
+    if modalidad == "variable" and db.grupo_id_desde_clave(username) is None:
         if (context.user_data.get(SCHED_USERNAME) != username
                 or context.user_data.get(SCHED_MODALIDAD) != "variable"
                 or not context.user_data.get(SCHED_SESIONES)
@@ -2048,6 +2428,8 @@ def sesiones_rotacion_confirmadas(perfil: dict) -> list[str]:
 
 
 def texto_modalidad_guardada(row) -> str:
+    if db.grupo_id_programacion(row) is not None:
+        return "Cada integrante usa su sesión preferida y sus respaldos con acceso."
     if db.modalidad_sesiones_de(row) == "variable":
         cantidad = len(db.sesiones_rotacion_de(row))
         return (f"Modalidad: VARIABLE · {cantidad} sesión(es) con acceso confirmado.\n"
@@ -2356,7 +2738,7 @@ async def enviar_archivo(
     )
 
 
-def consultar_historias_variables(chat_id: int, username: str, user_id: int | None):
+def consultar_historias_variables(chat_id: int, username: str, user_id: int | None, *, modo_descarga: str = "normal"):
     """Resolver y descargar en la misma sesión; conservar la preferida normal."""
     orden = db.preparar_rotacion(chat_id, username)
     if not orden:
@@ -2370,7 +2752,7 @@ def consultar_historias_variables(chat_id: int, username: str, user_id: int | No
             user_id = resolver_user_id(username)
             actualizar_user_id(username, user_id)
         try:
-            historias = descargar_historias(username, user_id)
+            historias = descargar_historias_segun_modo(chat_id, username, user_id, modo_descarga)
         except SinHistoriasDisponibles:
             sesion_exitosa = sesion.id
             raise
@@ -2381,16 +2763,18 @@ def consultar_historias_variables(chat_id: int, username: str, user_id: int | No
         return ejecutar_con_sesiones(username, consultar, orden_sesion_ids=orden,
                                      conservar_preferida=True)
     finally:
-        # Incluso un turno sin Stories o con todos los intentos fallidos avanza.
-        db.registrar_sesion_rotacion(chat_id, username, sesion_exitosa or orden[0])
+        paso_rotacion = sesion_exitosa if sesion_exitosa in orden else orden[0]
+        db.registrar_sesion_rotacion(chat_id, username, paso_rotacion)
 
 
+@scoped_operation
 async def revisar_usuario(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     username: str,
     *,
     manual: bool,
+    programacion_grupo=None,
 ) -> int:
     """
     Revisión manual:
@@ -2407,30 +2791,30 @@ async def revisar_usuario(
       - NO muestra fotos/videos;
       - manda un único aviso silencioso.
     """
-    # Una misma cuenta debe usar siempre la misma clave en la antirepetición,
-    # tanto si llega desde un botón manual como desde una programación antigua.
     username = limpiar_username(username)
 
     cuenta = buscar_cuenta(username)
+    modo = modo_descarga_historias(cuenta)
     user_id = (
         int(cuenta["user_id"])
         if cuenta and cuenta.get("user_id")
         else None
     )
 
-    async with IG_LOCK:
-        programacion = db.obtener_programacion(chat_id, username) if not manual else None
-        if programacion is not None and db.modalidad_sesiones_de(programacion) == "variable":
-            historias = await asyncio.to_thread(consultar_historias_variables, chat_id, username, user_id)
-        else:
-            if user_id is None:
-                user_id = await asyncio.to_thread(resolver_user_id, username)
-                actualizar_user_id(username, user_id)
-            historias = await asyncio.to_thread(descargar_historias, username, user_id)
+    with usar_solo_sesiones_asociadas(programacion_grupo is not None):
+        async with IG_LOCK:
+            comprobar_lote_no_detenido()
+            programacion = (programacion_grupo if programacion_grupo is not None else
+                            db.obtener_programacion(chat_id, username)) if not manual else None
+            if programacion_grupo is None and programacion is not None and db.modalidad_sesiones_de(programacion) == "variable":
+                opciones = {"modo_descarga": "portada"} if modo == "portada" else {}
+                historias = await asyncio.to_thread(consultar_historias_variables, chat_id, username, user_id, **opciones)
+            else:
+                if user_id is None:
+                    user_id = await asyncio.to_thread(resolver_user_id, username)
+                    actualizar_user_id(username, user_id)
+                historias = await asyncio.to_thread(descargar_historias_segun_modo, chat_id, username, user_id, modo)
 
-    # La comprobación y el registro del Story ID deben pertenecer a una única
-    # sección crítica. Así una revisión manual y una automática no pueden ver
-    # simultáneamente el mismo ID como "nuevo" antes de que una lo registre.
     async with STORY_PROCESS_LOCK:
         nuevas = []
         ids_vistos_en_respuesta: set[str] = set()
@@ -2438,7 +2822,6 @@ async def revisar_usuario(
         for historia in historias:
             story_pk = str(historia.story_pk)
 
-            # Defensa ante un mismo elemento repetido dentro de una respuesta.
             if story_pk in ids_vistos_en_respuesta:
                 continue
             ids_vistos_en_respuesta.add(story_pk)
@@ -2452,24 +2835,35 @@ async def revisar_usuario(
 
             nuevas.append(historia)
 
+        fallos_portada = [fallo for fallo in getattr(historias, "fallos_portada", [])
+                          if not db.historia_ya_enviada(chat_id, username, fallo.story_pk)]
+        if fallos_portada:
+            ids = " · ".join(f.story_pk for f in fallos_portada[:5])
+            texto = (f"⚠️ @{username}: {len(fallos_portada)} historia(s) sin portada utilizable.\n"
+                     "Quedan pendientes para volver a intentarlas.\n"
+                     f"Story ID: {ids}\nMotivo: {fallos_portada[0].motivo}")
+            try:
+                await enviar_texto_bot(context, chat_id=chat_id, text=texto, disable_notification=True)
+            except TelegramError:
+                logger.warning("No se pudo informar una portada pendiente de @%s", username)
+
         if not nuevas:
-            if manual:
+            if manual and not fallos_portada:
                 await enviar_texto_bot(context,
+                    borrar_en=AVISO_BORRADO_SEGUNDOS,
                     chat_id=chat_id,
                     text=(
                         f"ℹ️ @{username}: no hay Stories nuevas."
                     ),
                     disable_notification=True,
                 )
-            return 0
+            return ResultadoRevision(0, len(fallos_portada)) if modo == "portada" else 0
 
         notificaciones_activadas = True
 
         if not manual:
-            programacion = db.obtener_programacion(
-                chat_id,
-                username,
-            )
+            programacion = (programacion_grupo if programacion_grupo is not None else
+                            db.obtener_programacion(chat_id, username))
 
             if programacion is not None:
                 notificaciones_activadas = (
@@ -2478,9 +2872,6 @@ async def revisar_usuario(
                     )
                 )
 
-        # --------------------------------------------------------
-        # AUTOMÁTICO + NOTIFICACIONES DESACTIVADAS
-        # --------------------------------------------------------
         if (
             not manual
             and not notificaciones_activadas
@@ -2488,8 +2879,6 @@ async def revisar_usuario(
             procesadas = 0
 
             for historia in nuevas:
-                # Se vuelve a comprobar inmediatamente antes de procesar.
-                # Dentro de STORY_PROCESS_LOCK nadie puede intercalar otro envío.
                 if db.historia_ya_enviada(
                     chat_id,
                     username,
@@ -2497,7 +2886,6 @@ async def revisar_usuario(
                 ):
                     continue
 
-                # El archivo se conserva para el panel.
                 ruta_para_historia(
                     username,
                     historia,
@@ -2514,6 +2902,7 @@ async def revisar_usuario(
             if procesadas:
                 try:
                     await enviar_texto_bot(context,
+                        borrar_en=AVISO_BORRADO_SEGUNDOS,
                         chat_id=chat_id,
                         text=(
                             f"📥 @{username} subió "
@@ -2528,15 +2917,11 @@ async def revisar_usuario(
                         username,
                     )
 
-            return procesadas
+            return ResultadoRevision(procesadas, len(fallos_portada)) if modo == "portada" else procesadas
 
-        # --------------------------------------------------------
-        # MANUAL O AUTOMÁTICO + NOTIFICACIONES ACTIVADAS
-        # --------------------------------------------------------
-        # El aviso automático se envía sólo después de haber fijado, bajo el
-        # mismo lock, cuáles son realmente las Stories nuevas.
         if not manual:
             await enviar_texto_bot(context,
+                borrar_en=AVISO_BORRADO_SEGUNDOS,
                 chat_id=chat_id,
                 text=(
                     f"🔔 @{username}: "
@@ -2548,7 +2933,6 @@ async def revisar_usuario(
         procesadas = 0
 
         for historia in nuevas:
-            # Segunda comprobación defensiva inmediatamente antes del envío.
             if db.historia_ya_enviada(
                 chat_id,
                 username,
@@ -2577,7 +2961,6 @@ async def revisar_usuario(
                 )
                 continue
 
-            # Se registra el message_id para el botón BORRAR MULTIMEDIA.
             try:
                 db.registrar_multimedia_telegram(
                     chat_id,
@@ -2599,9 +2982,6 @@ async def revisar_usuario(
                     getattr(mensaje, "message_id", "?"),
                 )
 
-            # Sólo se marca como procesada después de que Telegram confirmó
-            # correctamente el envío. Una falla de Telegram no bloquea una
-            # Story nueva para el próximo intento.
             db.registrar_historia(
                 chat_id,
                 username,
@@ -2610,18 +2990,20 @@ async def revisar_usuario(
 
             procesadas += 1
 
-        return procesadas
+        return ResultadoRevision(procesadas, len(fallos_portada)) if modo == "portada" else procesadas
 
 
-async def revisar_cuentas_grupo(
+async def _revisar_cuentas_grupo_lote(
     context: ContextTypes.DEFAULT_TYPE,
     query,
     grupo_id: int | None = None,
+    *, control,
 ) -> None:
     """Revisar favoritas o un grupo con el mismo flujo manual de cada perfil."""
     if DESTACADAS_REVIEW_LOCK.locked():
         await enviar_texto_bot(
             context,
+            borrar_en=AVISO_BORRADO_SEGUNDOS,
             chat_id=AUTHORIZED_CHAT_ID,
             text="ℹ️ Ya hay una revisión de grupo en curso.",
             disable_notification=True,
@@ -2635,7 +3017,6 @@ async def revisar_cuentas_grupo(
             return
         titulo = grupo["nombre"] if grupo is not None else "favoritas"
         miembros = set(grupo["usuarios"]) if grupo is not None else None
-        # Una marca representa un perfil, aunque un archivo antiguo lo repita.
         cuentas = {}
         for cuenta in cargar_cuentas():
             if (cuenta["username"] in miembros if miembros is not None else cuenta.get("destacada") is True):
@@ -2654,36 +3035,40 @@ async def revisar_cuentas_grupo(
 
         total = len(cuentas)
         procesadas = sin_novedades = fallidas = omitidas = historias = 0
+        portadas_pendientes = 0
+        sin_sesion = 0
 
         async def mostrar_avance(texto: str, *, final: bool = False) -> None:
-            opciones = {"reply_markup": menu_grupos()} if final else {}
+            if final:
+                await enviar_menu_al_final(context, query, texto, reply_markup=menu_grupos())
+                return
             try:
-                await query.edit_message_text(texto, **opciones)
+                async with control.edicion:
+                    await query.edit_message_text(texto, reply_markup=None if control.detener.is_set() else menu_detener_lote(control))
             except TelegramError as error:
                 if "not modified" in str(error).lower():
                     return
                 logger.warning("No se pudo mostrar el avance del grupo: %s", error)
-                if final:
-                    await enviar_texto_bot(
-                        context,
-                        chat_id=AUTHORIZED_CHAT_ID,
-                        text=texto,
-                        disable_notification=True,
-                        **opciones,
-                    )
 
         def texto_avance(encabezado: str) -> str:
-            return (
+            texto = (
                 f"{encabezado}\n\n"
                 f"👤 Perfiles revisados: {procesadas}/{total}\n"
                 f"📥 Historias nuevas procesadas: {historias}\n"
                 f"ℹ️ Sin historias nuevas: {sin_novedades}\n"
                 f"⚠️ Perfiles con error: {fallidas}\n"
+                f"🔑 Sin sesión asociada disponible: {sin_sesion}\n"
                 f"↪️ Omitidos: {omitidas}\n"
                 f"📋 Pendientes: {total - procesadas - omitidas}"
             )
+            if portadas_pendientes:
+                texto += f"\n🖼 Portadas pendientes: {portadas_pendientes}"
+            return texto
 
+        await mostrar_avance(texto_avance(f"⏳ Preparando revisión de {titulo}"))
         for username in cuentas:
+            if control.detener.is_set():
+                break
             actual = buscar_cuenta(username)
             vigente = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id) if grupo_id is not None else None
             pertenece = (vigente is not None and username in vigente["usuarios"]) if grupo_id is not None else (
@@ -2694,17 +3079,12 @@ async def revisar_cuentas_grupo(
                 continue
             await mostrar_avance(texto_avance(f"⏳ Revisando {titulo}: @{username}"))
 
-            # Reutilizar la revisión individual conserva la selección de sesión,
-            # sus respaldos, el guardado, el envío y la antirrepetición global.
             tarea_revision = asyncio.create_task(revisar_usuario(
                 context, AUTHORIZED_CHAT_ID, username, manual=True,
             ))
             try:
                 cantidad = await asyncio.shield(tarea_revision)
             except asyncio.CancelledError:
-                # Un hilo de Playwright no se detiene al cancelar un callback.
-                # Esperar el perfil actual antes de liberar el lote evita solapes;
-                # los siguientes perfiles ya no se ejecutan.
                 while not tarea_revision.done():
                     try:
                         await asyncio.shield(tarea_revision)
@@ -2716,6 +3096,10 @@ async def revisar_cuentas_grupo(
                     logger.warning("La revisión cancelada terminó con un error: %s",
                                    tarea_revision.exception())
                 raise
+            except LoteDetenido:
+                break
+            except SinSesionAsociadaDisponible:
+                sin_sesion += 1
             except SinHistoriasDisponibles:
                 sin_novedades += 1
             except Exception as error:
@@ -2729,17 +3113,20 @@ async def revisar_cuentas_grupo(
                     logger.exception("No se pudo informar el error de @%s", username)
             else:
                 historias += cantidad
-                if cantidad == 0:
+                pendientes_portada = getattr(cantidad, "portadas_pendientes", 0)
+                portadas_pendientes += pendientes_portada
+                if pendientes_portada:
+                    fallidas += 1
+                elif cantidad == 0:
                     sin_novedades += 1
             procesadas += 1
 
         await mostrar_avance(
-            texto_avance(f"✅ Revisión de {titulo} completada"), final=True,
+            texto_avance(f"🛑 Revisión de {titulo} detenida" if control.detener.is_set() else f"✅ Revisión de {titulo} completada"), final=True,
         )
 
 
 async def revisar_cuentas_destacadas(context: ContextTypes.DEFAULT_TYPE, query) -> None:
-    # Mantener el callback anterior para los botones de favoritas ya enviados.
     await revisar_cuentas_grupo(context, query)
 
 
@@ -2759,6 +3146,10 @@ async def ejecucion_programada(
     )
 
     if row is None or not bool(row["activa"]):
+        return
+
+    if db.grupo_id_programacion(row) is not None:
+        await ejecutar_grupo_programado(context, row)
         return
 
     try:
@@ -2785,24 +3176,277 @@ async def ejecucion_programada(
         )
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+COMANDOS_NAVEGACION = (
+    ('start', 'Abrir el menú principal', 'menu'),
+    ('agregar', 'Agregar un perfil de Instagram', 'add'),
+    ('historias', 'Revisar historias de un perfil', 'stories_menu'),
+    ('grupos', 'Revisar grupos de perfiles', 'groups_menu'),
+    ('publicaciones', 'Descargar publicaciones', 'publications_menu'),
+    ('destacadas', 'Abrir historias destacadas', 'highlights_menu'),
+    ('cuentas', 'Gestionar perfiles y asociaciones', 'manage'),
+    ('programar', 'Programar una revisión', 'schedules'),
+    ('programaciones', 'Ver las programaciones guardadas', 'sched_list'),
+    ('estado', 'Comprobar el estado de las sesiones', 'status'),
+    ('backups', 'Abrir el menú de backups', 'backups_menu'),
+    ('cancelar', 'Salir del formulario o selección actual', 'menu'),
+    ('ayuda', 'Ver comandos y ejemplos', 'navigation_help'),
+)
+SUGERENCIAS_TTL = 300
+_SUGERENCIAS_KEY = '_navigation_suggestions'
+NAVIGATION_CONTEXT = ContextVar('storypulse_navigation_context', default=None)
+
+
+def _datos_navegacion(context):
+    application = getattr(context, 'application', None)
+    if application is not None:
+        return application.bot_data
+    if not hasattr(context, '_navigation_data'):
+        context._navigation_data = {}
+    return context._navigation_data
+
+
+def obtener_navegacion(context):
+    NAVIGATION_CONTEXT.set(context)
+    datos = _datos_navegacion(context)
+    if '_navigation_manager' not in datos:
+        def registrar(message):
+            cancelar_borrado_aviso(context, message)
+            registrar_mensaje_limpiable(int(message.chat.id), int(message.message_id))
+
+        def retirar(chat_id, message_id):
+            cancelar_borrado_aviso(context, chat_id, message_id)
+            db.eliminar_registros_chat_limpiables(chat_id, [message_id])
+
+        datos['_navigation_manager'] = NavigationManager(
+            context.bot, BASE_DIR / '.navigation-state.json',
+            on_track=registrar, on_retire=retirar,
+        )
+    return datos['_navigation_manager']
+
+
+async def preparar_respuesta_texto(context):
+    manager = obtener_navegacion(context)
+    if context.user_data.get(STATE) in {PAUSE_DURATION, PAUSE_DATE}:
+        seleccion = context.user_data.get(PAUSE_SELECTION) or {}
+        anterior = seleccion.get('query')
+        message = getattr(anterior, 'message', None)
+        if message is not None and manager.is_active(AUTHORIZED_CHAT_ID, message.message_id):
+            vista = await manager.begin(AUTHORIZED_CHAT_ID, source_message=message)
+            seleccion['query'] = vista
+            return vista
+        seleccion['query'] = None
+    return await manager.begin(AUTHORIZED_CHAT_ID, force_new=True)
+
+
+def _olvidar_sugerencias(context):
+    _datos_navegacion(context).setdefault(_SUGERENCIAS_KEY, {}).pop(AUTHORIZED_CHAT_ID, None)
+
+
+def _firma_destino(propuesta):
+    if propuesta.target_type == 'profile':
+        cuenta = buscar_cuenta(propuesta.target_id)
+        if cuenta is None:
+            return None
+        return (str(cuenta.get('username')), str(cuenta.get('nombre')), str(cuenta.get('user_id')))
+    if propuesta.target_type == 'group':
+        try:
+            grupo_id = int(propuesta.target_id)
+        except (TypeError, ValueError):
+            return None
+        grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id)
+        if grupo is None:
+            return None
+        return (grupo_id, str(grupo.get('nombre')), tuple(sorted(grupo.get('usuarios', ()))))
+    return () if propuesta.target_id is None and propuesta.target_type is None else None
+
+
+def _accion_sugerida(propuesta):
+    """Resolve only actions known by the existing controller."""
+    menus = {
+        'menu': 'menu', 'add': 'add', 'accounts': 'manage',
+        'groups': 'groups_menu', 'schedules': 'sched_list', 'backups': 'backups_menu',
+        'status': 'status', 'help': 'navigation_help',
+        'stories': 'stories_menu', 'publications': 'publications_menu',
+        'highlights': 'highlights_menu', 'schedule': 'schedules',
+        'group_review': 'groups_menu',
+    }
+    if propuesta.target_type is None and propuesta.target_id is None:
+        return menus.get(propuesta.action)
+    if _firma_destino(propuesta) is None:
+        return None
+    if propuesta.target_type == 'profile':
+        username = limpiar_username(propuesta.target_id)
+        prefijos = {'stories': 'review:', 'publications': 'publications:',
+                    'highlights': 'highlights:', 'schedule': 'sched_target:'}
+        prefix = prefijos.get(propuesta.action)
+        return prefix + username if prefix else None
+    if propuesta.target_type == 'group':
+        grupo_id = int(propuesta.target_id)
+        if propuesta.action == 'group_review':
+            return f'group_review:{grupo_id}'
+        if propuesta.action == 'schedule':
+            return 'sched_target:' + db.clave_programacion_grupo(grupo_id)
+    return None
+
+
+def _accion_larga(data):
+    return data == 'status' or data.startswith(('review:', 'group_review:', 'publications:', 'highlights:'))
+
+
+class ContextoTrabajoNavegacion:
+    """A running read operation must not clear a newer interactive form."""
+    def __init__(self, context):
+        self._context = context
+        self.user_data = dict(context.user_data)
+
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
+
+async def _despachar_navegacion(update, context, vista, data):
+    if _accion_larga(data):
+        trabajo = ContextoTrabajoNavegacion(context)
+        context.application.create_task(ejecutar_accion(trabajo, vista, data, update=update), update=update)
+    else:
+        await ejecutar_accion(context, vista, data, update=update)
+
+
+def texto_ayuda_navegacion():
+    lineas = ['🧭 Accesos directos', '']
+    lineas.extend('/' + comando + ' — ' + descripcion for comando, descripcion, _ in COMANDOS_NAVEGACION)
+    lineas.extend([
+        '', 'También podés escribir, por ejemplo:',
+        '• revisar historias @usuario', '• revisar grupo ejemplo',
+        '• programar revisión de @usuario', '• descargar publicaciones de @usuario',
+        '', 'Busco entre los perfiles y grupos guardados. Si hay errores o varias coincidencias, '
+        'te muestro opciones para confirmar. No inicio consultas a Instagram antes de que elijas.',
+        '', 'Si estás completando un formulario, el texto sigue siendo la respuesta a ese formulario. '
+        'Usá /cancelar para salir. Esto no detiene trabajos ni elimina programaciones.',
+    ])
+    return '\n'.join(lineas)
+
+
+async def comando_atajo(update, context):
     if not autorizado(update):
         return
-
-    registrar_texto_entrante(
-        update
-    )
-
+    registrar_texto_entrante(update)
+    texto = (update.effective_message.text or '').strip()
+    partes = texto.split(maxsplit=1)
+    comando = partes[0].split('@', 1)[0].lstrip('/').casefold() if partes else ''
+    rutas = {nombre: destino for nombre, _, destino in COMANDOS_NAVEGACION}
+    rutas['menu'] = 'menu'
+    destino = rutas.get(comando)
+    if destino is None:
+        return
     context.user_data.clear()
+    _olvidar_sugerencias(context)
+    vista = await obtener_navegacion(context).begin(AUTHORIZED_CHAT_ID, force_new=True)
+    if len(partes) > 1 and comando in {'historias', 'grupos', 'publicaciones', 'destacadas', 'programar'}:
+        hint = {'historias': 'stories', 'grupos': 'group_review', 'publicaciones': 'publications',
+                'destacadas': 'highlights', 'programar': 'schedule'}[comando]
+        await proponer_desde_texto(update, context, partes[1], hint=hint)
+        return
+    await _despachar_navegacion(update, context, vista, destino)
 
-    await responder_texto(update,
-        "📱 StoryPulse Web Private\n\n"
-        "Seleccioná una opción:",
-        reply_markup=menu_principal(),
-    )
+
+async def proponer_desde_texto(update, context, texto, *, hint=None):
+    if not autorizado(update):
+        return
+    manager = obtener_navegacion(context)
+    vista = manager.current_view(AUTHORIZED_CHAT_ID)
+    if vista is None:
+        vista = await manager.begin(AUTHORIZED_CHAT_ID, force_new=True)
+    _olvidar_sugerencias(context)
+    propuestas = propose_intents(texto, cargar_cuentas(), db.listar_grupos_cuentas(AUTHORIZED_CHAT_ID), hint=hint)
+    if not propuestas:
+        await vista.edit_message_text(
+            'No pude identificar una acción y un destino con suficiente claridad.\n\n'
+            'Probá «revisar historias @usuario», «revisar grupo ejemplo» o elegí una opción del menú. '
+            'Para ver los accesos disponibles, usá /ayuda.',
+            reply_markup=menu_principal(),
+        )
+        return
+    token = uuid.uuid4().hex[:12]
+    filas = [[InlineKeyboardButton(propuesta.label[:100], callback_data=f'nlp_pick:{token}:{i}')]
+             for i, propuesta in enumerate(propuestas)]
+    filas.append([InlineKeyboardButton('❌ Cancelar', callback_data='menu')])
+    mensaje = await vista.edit_message_text('¿Quisiste decir…?\n\nElegí una opción para continuar.',
+                                          reply_markup=InlineKeyboardMarkup(filas))
+    if mensaje is None or not manager.is_active(AUTHORIZED_CHAT_ID, mensaje.message_id):
+        return
+    _datos_navegacion(context).setdefault(_SUGERENCIAS_KEY, {})[AUTHORIZED_CHAT_ID] = {
+        'token': token, 'message_id': int(mensaje.message_id),
+        'user_id': int(update.effective_user.id), 'created': time.monotonic(),
+        'choices': propuestas, 'snapshots': [_firma_destino(p) for p in propuestas],
+    }
+
+
+async def callback_sugerencia(update, context):
+    query = update.callback_query
+    if query is None:
+        return
+    if not autorizado(update):
+        await query.answer()
+        return
+    almacen = _datos_navegacion(context).setdefault(_SUGERENCIAS_KEY, {})
+    seleccion = almacen.get(AUTHORIZED_CHAT_ID)
+    partes = (query.data or '').split(':')
+    manager = obtener_navegacion(context)
+    indice = int(partes[2]) if len(partes) == 3 and partes[2].isascii() and partes[2].isdigit() and len(partes[2]) <= 2 else -1
+    valido = (isinstance(seleccion, dict) and len(partes) == 3 and partes[0] == 'nlp_pick'
+              and partes[1] == seleccion.get('token')
+              and seleccion.get('user_id') == int(update.effective_user.id)
+              and seleccion.get('message_id') == getattr(query.message, 'message_id', None)
+              and manager.is_active(AUTHORIZED_CHAT_ID, seleccion['message_id'])
+              and 0 <= time.monotonic() - seleccion.get('created', 0) <= SUGERENCIAS_TTL
+              and 0 <= indice < len(seleccion.get('choices', ())))
+    if not valido:
+        await query.answer('Esta selección venció. Escribí el pedido nuevamente.')
+        return
+    propuesta = seleccion['choices'][indice]
+    if seleccion['snapshots'][indice] != _firma_destino(propuesta):
+        almacen.pop(AUTHORIZED_CHAT_ID, None)
+        await query.answer('El perfil o grupo cambió. Volvé a buscarlo.')
+        return
+    data = _accion_sugerida(propuesta)
+    if data is None:
+        almacen.pop(AUTHORIZED_CHAT_ID, None)
+        await query.answer('Ese destino ya no está disponible.')
+        return
+    almacen.pop(AUTHORIZED_CHAT_ID, None)
+    try:
+        vista = await manager.begin(AUTHORIZED_CHAT_ID, source_message=query.message, callback=query)
+    except StaleMenu:
+        await query.answer('Ese menú ya no está activo.')
+        return
+    await query.answer()
+    context.user_data.clear()
+    await _despachar_navegacion(update, context, vista, data)
+
+
+async def publicar_comandos_navegacion(application):
+    from telegram import BotCommandScopeChat, MenuButtonCommands
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand(nombre, descripcion) for nombre, descripcion, _ in COMANDOS_NAVEGACION],
+            scope=BotCommandScopeChat(chat_id=AUTHORIZED_CHAT_ID),
+        )
+        await application.bot.set_chat_menu_button(chat_id=AUTHORIZED_CHAT_ID, menu_button=MenuButtonCommands())
+    except TelegramError:
+        logger.warning('No se pudieron publicar los accesos de Telegram. Los comandos escritos siguen disponibles.')
+
+
+async def _aviso_backup_navegacion(context, texto, **kwargs):
+    return await enviar_texto_bot(context, chat_id=AUTHORIZED_CHAT_ID, text=texto, temporal=False, **kwargs)
+
+
+async def _respuesta_backup_navegacion(update, context, texto, **kwargs):
+    return await responder_texto(update, texto, context=context, **kwargs)
+
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await comando_atajo(update, context)
 
 
 async def callback_grupos(context: ContextTypes.DEFAULT_TYPE, query, data: str) -> bool:
@@ -2857,6 +3501,8 @@ async def callback_grupos(context: ContextTypes.DEFAULT_TYPE, query, data: str) 
             context.user_data[GROUP_DRAFT] = borrador
             await mostrar_seleccion_grupo(query, borrador)
         elif data.startswith("group_delete_confirm:"):
+            if db.obtener_programacion(AUTHORIZED_CHAT_ID, db.clave_programacion_grupo(grupo_id)) is not None:
+                eliminar_jobs_usuario(context.application, AUTHORIZED_CHAT_ID, db.clave_programacion_grupo(grupo_id))
             db.eliminar_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id)
             await query.edit_message_text(f"✅ Grupo eliminado: {grupo['nombre']}.", reply_markup=menu_grupos())
         else:
@@ -2924,45 +3570,62 @@ async def callback_grupos(context: ContextTypes.DEFAULT_TYPE, query, data: str) 
     return False
 
 
-async def callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
-    if not query:
+    if query is None:
         return
-
-    if (
-        query.data == "chat_clean_confirm"
-        and autorizado(update)
-        and int(update.effective_chat.id) in LIMPIEZAS_CHAT_EN_CURSO
-    ):
+    if not autorizado(update):
+        await query.answer()
+        return
+    if (query.data == "chat_clean_confirm"
+            and int(update.effective_chat.id) in LIMPIEZAS_CHAT_EN_CURSO):
         await query.answer("La limpieza ya está en curso.")
         return
-
+    manager = obtener_navegacion(context)
+    data = normalizar_callback_programacion_grupo(context, query.data or "")
+    try:
+        vista = await manager.begin(AUTHORIZED_CHAT_ID, source_message=query.message,
+                                    callback=query, control=data.startswith('batch_stop:'))
+    except StaleMenu:
+        await query.answer('Ese menú ya no está activo. Usá /start para continuar.')
+        return
     await query.answer()
+    _olvidar_sugerencias(context)
+    if query.message is not None:
+        registrar_mensaje_limpiable(int(query.message.chat.id), int(query.message.message_id))
+        cancelar_borrado_aviso(context, query.message)
+    await ejecutar_accion(context, vista, data, update=update)
 
-    if not autorizado(update):
+
+async def ejecutar_accion(context, query, data: str, *, update=None) -> None:
+    """Shared action path for authorized buttons, shortcuts and confirmations."""
+    if data == 'navigation_help':
+        await query.edit_message_text(texto_ayuda_navegacion(), reply_markup=menu_principal())
+        return
+    if data == "backups_menu":
+        context.user_data.clear()
+    if await backups.callback(context, query, data):
         return
 
-    # El callback edita un mensaje ya existente. Lo registramos acá
-    # para que incluso un menú creado por la versión anterior pueda
-    # ser eliminado por LIMPIAR CHAT.
-    if query.message is not None:
-        registrar_mensaje_limpiable(
-            int(query.message.chat.id),
-            int(query.message.message_id),
-        )
+    if await callback_control_lotes(context, query, data):
+        return
 
-    data = query.data or ""
+    if await callback_pausas_sesiones(context, query, data):
+        return
+
+    if await callback_modo_historias(context, query, data):
+        return
+
+    if await callback_destinos_programacion(context, query, data):
+        return
 
     if await callback_grupos(context, query, data):
         return
 
     if data == "menu":
         context.user_data.clear()
-        await query.edit_message_text(
+        await enviar_menu_al_final(
+            context, query,
             "📱 StoryPulse Web Private\n\n"
             "Seleccioná una opción:",
             reply_markup=menu_principal(),
@@ -3090,6 +3753,7 @@ async def callback(
             etiquetas = {
                 "iniciando": "Preparando navegador y sesión",
                 "procesando": "Descargando y guardando Highlights",
+                "esperando_cdn": "En pausa por límite de descarga; continúa automáticamente",
                 "terminado": "Finalizando",
             }
             etapa = etiquetas.get(
@@ -3107,6 +3771,7 @@ async def callback(
             return (
                 f"⏳ Descargando Highlights de @{username}...\n\n"
                 f"🟢 Estado: {etapa}\n"
+                f"{aviso_espera_cdn(estado)}"
                 f"🕒 Tiempo: {tiempo_texto}\n"
                 f"✨ Carruseles detectados: {grupos_detectados}\n"
                 f"⚙️ Carruseles procesados: {grupos_procesados}/{grupos_detectados}\n"
@@ -3260,6 +3925,7 @@ async def callback(
                 "leyendo_perfil": "Leyendo el perfil",
                 "recorriendo": "Recorriendo publicaciones del perfil",
                 "procesando": "Descargando y guardando contenido",
+                "esperando_cdn": "En pausa por límite de descarga; continúa automáticamente",
                 "finalizando": "Finalizando y guardando estado",
                 "terminado": "Finalizando",
             }
@@ -3284,6 +3950,7 @@ async def callback(
             return (
                 f"⏳ Descargando publicaciones de @{username}...\n\n"
                 f"🟢 Estado: {etapa}\n"
+                f"{aviso_espera_cdn(estado)}"
                 f"🕒 Tiempo: {tiempo_texto}\n"
                 f"🔎 Posts localizados: {progreso_posts}\n"
                 f"⚙️ Posts procesados: {procesados}\n"
@@ -3314,7 +3981,6 @@ async def callback(
 
         try:
             try:
-                # Comparte con Stories la selección y asociación de sesiones.
                 async with IG_LOCK:
                     resultado = await asyncio.to_thread(
                         descargar_publicaciones,
@@ -3524,7 +4190,6 @@ async def callback(
     if data.startswith("dedupe_reset_confirm:"):
         partes = data.split(":", 2)
         username = limpiar_username(partes[1])
-        # Los botones de la versión anterior conservan el reseteo completo.
         codigo = partes[2] if len(partes) == 3 else "todo"
         if codigo not in ANTIREPETICION_TIPOS:
             await query.edit_message_text(
@@ -3728,8 +4393,6 @@ async def callback(
                 progreso_estado.update(datos)
 
         def actualizar_accesos_desde_paginas() -> dict:
-            # El navegador se crea al verificar el primer perfil bajo la
-            # sesión elegida y se reutiliza durante todo el lote.
             with comprobar_perfiles_desde_pagina() as verificar:
                 return actualizar_accesos_sesion(
                     elegida.id,
@@ -3780,8 +4443,6 @@ async def callback(
                     try:
                         resultado = await asyncio.shield(tarea_accesos)
                     except asyncio.CancelledError:
-                        # Cancelar el callback no detiene el hilo. Conservar el
-                        # bloqueo hasta que termine evita consultas solapadas.
                         while not tarea_accesos.done():
                             try:
                                 await asyncio.shield(tarea_accesos)
@@ -3918,9 +4579,10 @@ async def callback(
             data.split(":", 1)[1]
         )
 
-        await query.edit_message_text(
-            f"⏳ Revisando @{username}..."
+        aviso_revision = await query.edit_message_text(
+            f"⏳ Revisando @{username}...", reply_markup=None,
         )
+        programar_borrado_aviso(context, aviso_revision)
 
         try:
             cantidad = await revisar_usuario(
@@ -3936,16 +4598,24 @@ async def callback(
                     f"✅ @{username}: "
                     f"{cantidad} Story(s) nueva(s) procesada(s)."
                 ),
-                reply_markup=menu_principal(),
+                borrar_en=AVISO_BORRADO_SEGUNDOS,
                 disable_notification=True,
+            )
+            await enviar_texto_bot(
+                context, chat_id=AUTHORIZED_CHAT_ID, text="Menú:",
+                reply_markup=menu_principal(), disable_notification=True,
             )
 
         except SinHistoriasDisponibles:
             await enviar_texto_bot(context,
                 chat_id=AUTHORIZED_CHAT_ID,
                 text=f"ℹ️ @{username} no tiene Stories visibles.",
-                reply_markup=menu_principal(),
+                borrar_en=AVISO_BORRADO_SEGUNDOS,
                 disable_notification=True,
+            )
+            await enviar_texto_bot(
+                context, chat_id=AUTHORIZED_CHAT_ID, text="Menú:",
+                reply_markup=menu_principal(), disable_notification=True,
             )
 
         except Exception as error:
@@ -4010,7 +4680,7 @@ async def callback(
 
     if data.startswith(("sched:", "schedv:")):
         modalidad = "variable" if data.startswith("schedv:") else "normal"
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4032,7 +4702,7 @@ async def callback(
 
             await query.edit_message_text(
                 (
-                    f"ℹ️ <b>@{esc(username)}</b> ya tiene "
+                    f"ℹ️ <b>{esc(nombre_visible_programacion(username))}</b> ya tiene "
                     "una programación activa.\n\n"
                     "No se creó una programación duplicada."
                 ),
@@ -4046,7 +4716,7 @@ async def callback(
                  and context.user_data.get(SCHED_SESIONES))
         if modalidad == "variable" and not cache:
             context.user_data.clear()
-            await query.edit_message_text(f"⏳ Comprobando qué sesiones tienen acceso a @{username}...")
+            await query.edit_message_text(f"⏳ Comprobando qué sesiones tienen acceso a {nombre_visible_programacion(username)}...")
             try:
                 async with IG_LOCK:
                     perfil = await asyncio.to_thread(verificar_accesos_perfil, username,
@@ -4064,7 +4734,7 @@ async def callback(
                                       SCHED_SESIONES_ELEGIDAS: None,
                                       SCHED_SESIONES: sesiones})
             await query.edit_message_text(
-                f"🔄 @{username}\n\nSe detectaron {len(sesiones)} sesión(es) con acceso. "
+                f"🔄 {nombre_visible_programacion(username)}\n\nSe detectaron {len(sesiones)} sesión(es) con acceso. "
                 "Elegí una o varias para las ejecuciones automáticas:",
                 reply_markup=menu_seleccionar_sesiones_variable(
                     username, context, getattr(query.message, "message_id", None)),
@@ -4072,7 +4742,7 @@ async def callback(
             return
         if modalidad == "variable" and not context.user_data.get(SCHED_SESIONES_ELEGIDAS):
             await query.edit_message_text(
-                f"🔄 @{username}\n\nElegí una o varias sesiones para las ejecuciones automáticas:",
+                f"🔄 {nombre_visible_programacion(username)}\n\nElegí una o varias sesiones para las ejecuciones automáticas:",
                 reply_markup=menu_seleccionar_sesiones_variable(
                     username, context, getattr(query.message, "message_id", None)),
             )
@@ -4086,7 +4756,7 @@ async def callback(
                    + ("Sólo hay una: las revisiones usarán esa cuenta.\n" if cantidad == 1 else "")) if modalidad == "variable" else ""
 
         await query.edit_message_text(
-            f"⏰ @{username}\n\n"
+            f"⏰ {nombre_visible_programacion(username)}\n\n"
             f"{resumen}"
             "¿Cómo querés programar las revisiones?",
             reply_markup=menu_tipo_programacion(
@@ -4120,7 +4790,7 @@ async def callback(
             elegidas.append(sesion_id)
         context.user_data[SCHED_SESIONES_ELEGIDAS] = elegidas
         await query.edit_message_text(
-            f"🔄 @{username}\n\nElegidas: {len(elegidas)} de {len(detectadas)}. "
+            f"🔄 {nombre_visible_programacion(username)}\n\nElegidas: {len(elegidas)} de {len(detectadas)}. "
             "Podés seleccionar una o varias:",
             reply_markup=menu_seleccionar_sesiones_variable(
                 username, context, getattr(query.message, "message_id", None)),
@@ -4145,7 +4815,7 @@ async def callback(
         context.user_data.pop(SCHED_SELECCION_TOKENS, None)
         context.user_data.pop(SCHED_SELECCION_MESSAGE_ID, None)
         await query.edit_message_text(
-            f"✅ @{username}\n\nSe usarán {len(elegidas)} sesión(es) elegida(s).\n\n"
+            f"✅ {nombre_visible_programacion(username)}\n\nSe usarán {len(elegidas)} sesión(es) elegida(s).\n\n"
             "¿Cómo querés programar las revisiones?",
             reply_markup=menu_tipo_programacion(username, "variable"),
         )
@@ -4153,7 +4823,7 @@ async def callback(
 
     if data.startswith(("sched_mode_daily:", "schedv_mode_daily:")):
         modalidad = "variable" if data.startswith("schedv_") else "normal"
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4163,7 +4833,7 @@ async def callback(
             return
 
         await query.edit_message_text(
-            f"📅 @{username}\n\n"
+            f"📅 {nombre_visible_programacion(username)}\n\n"
             "¿Cuántas revisiones por día?",
             reply_markup=menu_cantidad(
                 username, modalidad
@@ -4173,7 +4843,7 @@ async def callback(
 
     if data.startswith(("sched_mode_interval:", "schedv_mode_interval:")):
         modalidad = "variable" if data.startswith("schedv_") else "normal"
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4183,7 +4853,7 @@ async def callback(
             return
 
         await query.edit_message_text(
-            f"⏱ @{username}\n\n"
+            f"⏱ {nombre_visible_programacion(username)}\n\n"
             "Elegí cada cuánto tiempo revisar.\n\n"
             "Después vas a elegir el minuto exacto de la hora "
             "en que querés hacer las revisiones.",
@@ -4199,7 +4869,7 @@ async def callback(
             ":",
             2,
         )
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             username
         )
         horas = int(
@@ -4229,7 +4899,7 @@ async def callback(
 
         await query.edit_message_text(
             (
-                f"⏱ @{username}\n\n"
+                f"⏱ {nombre_visible_programacion(username)}\n\n"
                 f"Intervalo: {texto_intervalo}\n\n"
                 "¿En qué minuto de la hora querés hacer la revisión?\n\n"
                 "Escribí un número del 0 al 59.\n"
@@ -4241,7 +4911,7 @@ async def callback(
     if data.startswith(("sched_count:", "schedv_count:")):
         modalidad = "variable" if data.startswith("schedv_") else "normal"
         _, username, cantidad = data.split(":", 2)
-        username = limpiar_username(username)
+        username = limpiar_destino_programacion(username)
         cantidad = int(cantidad)
 
         if not 1 <= cantidad <= 6:
@@ -4257,7 +4927,7 @@ async def callback(
         context.user_data["times"] = []
 
         await query.edit_message_text(
-            f"⏰ @{username}\n\n"
+            f"⏰ {nombre_visible_programacion(username)}\n\n"
             f"Escribí el horario 1 de {cantidad}.\n"
             "Formato HH:MM, hora de Argentina.\n"
             "Ejemplo: 21:30"
@@ -4279,7 +4949,7 @@ async def callback(
         await query.edit_message_text(
             (
                 "📋 <b>Programaciones</b>\n\n"
-                "Elegí una cuenta para ver su programación:"
+                "Elegí una cuenta o grupo para ver su programación:"
             ),
             parse_mode="HTML",
             reply_markup=menu_lista_programaciones(
@@ -4419,7 +5089,7 @@ async def callback(
         return
 
     if data.startswith("sched_detail:"):
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4462,7 +5132,7 @@ async def callback(
         return
 
     if data.startswith("sched_toggle:"):
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4532,7 +5202,7 @@ async def callback(
         return
 
     if data.startswith("sched_notify:"):
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4582,7 +5252,7 @@ async def callback(
         return
 
     if data.startswith("sched_delete:"):
-        username = limpiar_username(
+        username = limpiar_destino_programacion(
             data.split(":", 1)[1]
         )
 
@@ -4604,9 +5274,9 @@ async def callback(
         if rows:
             await query.edit_message_text(
                 (
-                    f"✅ Programación de @{esc(username)} eliminada.\n\n"
+                    f"✅ Programación de {esc(nombre_visible_programacion(username))} eliminada.\n\n"
                     "📋 <b>Programaciones</b>\n\n"
-                    "Elegí una cuenta para ver su programación:"
+                    "Elegí una cuenta o grupo para ver su programación:"
                 ),
                 parse_mode="HTML",
                 reply_markup=menu_lista_programaciones(
@@ -4616,7 +5286,7 @@ async def callback(
         else:
             await query.edit_message_text(
                 (
-                    f"✅ Programación de @{esc(username)} eliminada.\n\n"
+                    f"✅ Programación de {esc(nombre_visible_programacion(username))} eliminada.\n\n"
                     "ℹ️ No quedan programaciones."
                 ),
                 parse_mode="HTML",
@@ -4764,7 +5434,6 @@ async def callback(
             )
             return
 
-        # Avisamos inmediatamente para que Telegram no parezca congelado.
         try:
             await query.edit_message_text(
                 (
@@ -4780,8 +5449,6 @@ async def callback(
         ya_no_existen: list[int] = []
         fallidos: list[tuple[int, str]] = []
 
-        # Se hace uno por uno para saber exactamente qué ID aceptó
-        # Telegram y no depender de una respuesta global del lote.
         for posicion, message_id in enumerate(
             message_ids,
             start=1,
@@ -4813,9 +5480,6 @@ async def callback(
                 detalle = str(error)
                 detalle_lower = detalle.lower()
 
-                # Si Telegram dice que el mensaje ya no existe,
-                # limpiamos también el registro local porque no hay
-                # nada más que borrar.
                 if (
                     "message to delete not found" in detalle_lower
                     or "message not found" in detalle_lower
@@ -4843,8 +5507,6 @@ async def callback(
                         detalle,
                     )
 
-            # Evita disparar muchas operaciones seguidas cuando hay
-            # decenas de mensajes registrados.
             if posicion < len(message_ids):
                 await asyncio.sleep(0.08)
 
@@ -4868,7 +5530,6 @@ async def callback(
         )
 
         if fallidos:
-            # Mostrar sólo el primer error evita llenar el chat.
             primer_id, primer_error = fallidos[0]
             texto += (
                 "\n\n<b>Primer error:</b>\n"
@@ -4924,7 +5585,6 @@ async def callback(
                         anterior = texto
                     except TelegramError:
                         logger.warning("No se pudo actualizar el progreso de Estado.")
-                # Sólo regula las ediciones de Telegram; no pausa sesiones.
                 await asyncio.sleep(2)
 
         tarea_progreso = asyncio.create_task(refrescar_estado())
@@ -4937,8 +5597,6 @@ async def callback(
                     estados = await asyncio.shield(tarea_estado)
                 except asyncio.CancelledError:
                     detener.set()
-                    # Mantener el bloqueo hasta que el navegador termine evita
-                    # solapar el hilo cancelado con otra consulta de Instagram.
                     await asyncio.shield(tarea_estado)
                     raise
         except Exception as error:
@@ -4959,13 +5617,13 @@ async def callback(
         if error_general:
             texto += f"❌ No se pudo completar la comprobación: {error_general}\n\n"
         elif not estados:
-            texto += "No hay sesiones habilitadas configuradas.\n\n"
+            texto += "No hay sesiones configuradas.\n\n"
         for estado in estados:
             nombre = estado.get("username")
             etiqueta = f"@{nombre} ({estado['id']})" if nombre else estado["id"]
             detalle = str(estado.get("detalle", ""))[:700]
             bloque = (
-                f"{'✅' if estado['disponible'] else '❌'} <b>{esc(etiqueta)}</b>\n"
+                f"{'🟡' if estado.get('pausada') else '🟢' if estado['disponible'] else '🔴'} <b>{esc(etiqueta)}</b>\n"
                 f"{esc(detalle)}\n\n"
             )
             if len(texto) + len(bloque) > 3600:
@@ -4981,7 +5639,6 @@ async def callback(
             partes.append(texto)
             texto = cabecera
         partes.append(texto + resumen)
-        # Cada entrada conserva su HTML completo, sin omitir ninguna sesión.
         await query.edit_message_text(
             partes[0], parse_mode="HTML",
             reply_markup=menu_estado() if len(partes) == 1 else None,
@@ -5041,7 +5698,16 @@ async def recibir_texto(
         update.effective_message.text or ""
     ).strip()
 
+    await preparar_respuesta_texto(context)
+    _olvidar_sugerencias(context)
+
+    if await backups.recibir_texto(update, context, texto):
+        return
+
     estado = context.user_data.get(STATE)
+
+    if await recibir_texto_pausa(update, context, texto, estado):
+        return
 
     if estado == GROUP_NAME:
         try:
@@ -5068,7 +5734,9 @@ async def recibir_texto(
     if estado == GROUP_MEMBERS:
         borrador = context.user_data.get(GROUP_DRAFT) or {}
         accion = "Guardar cambios" if borrador.get("grupo_id") is not None else "Crear grupo"
-        await responder_texto(update, f"Elegí los perfiles con los botones del mensaje anterior y tocá {accion} al terminar.")
+        await enviar_texto_bot(context, chat_id=AUTHORIZED_CHAT_ID,
+            text=f"Elegí los perfiles con los botones del mensaje anterior y tocá {accion} al terminar.",
+            disable_notification=True)
         return
 
     if estado == ADD_NAME:
@@ -5080,7 +5748,7 @@ async def recibir_texto(
 
         await responder_texto(update,
             "Ahora escribí el username de Instagram.\n"
-            "Ejemplo: usuario_ejemplo"
+            "Ejemplo: leo_messi"
         )
         return
 
@@ -5113,10 +5781,6 @@ async def recibir_texto(
                     username,
                 )
 
-                # Criterio estricto para perfiles privados:
-                # sólo se agrega si la propia comprobación de acceso confirma
-                # explícitamente following=True. Si devuelve False o None,
-                # se considera que la sesión no tiene acceso suficiente.
                 if (
                     bool(perfil.get("is_private"))
                     and perfil.get("following") is not True
@@ -5225,9 +5889,6 @@ async def recibir_texto(
             context.user_data[SCHED_INTERVAL_HOURS]
         )
 
-        # Evita que dos programaciones activas compartan el mismo minuto.
-        # Se revisan tanto los intervalos como los horarios fijos existentes.
-        # Las programaciones pausadas no reservan ningún minuto.
         conflicto_username: str | None = None
         conflicto_detalle: str | None = None
 
@@ -5300,17 +5961,19 @@ async def recibir_texto(
                 update,
                 (
                     f"❌ El minuto :{minuto:02d} ya está ocupado por "
-                    f"@{conflicto_username}.\n"
+                    f"{nombre_visible_programacion(conflicto_username)}.\n"
                     f"Programación activa: {conflicto_detalle}.\n\n"
                     "Elegí otro minuto del 0 al 59."
                 ),
             )
             return
 
-        # El ancla conserva la hora actual y sustituye solamente el minuto.
-        # La DB suma el intervalo completo desde esta ancla, por lo que:
-        # 13:45 + intervalo 1 h + minuto 46 -> 14:46
-        # 13:45 + intervalo 2 h + minuto 46 -> 15:46
+        if not validar_destino_flujo(context):
+            context.user_data.clear()
+            await responder_texto(update, "El destino ya no existe o no tiene perfiles agregados. Volvé a elegirlo.",
+                                  reply_markup=menu_destinos_programacion())
+            return
+
         ahora_local = datetime.now(TZ)
         inicio_local = ahora_local.replace(
             minute=minuto,
@@ -5359,7 +6022,7 @@ async def recibir_texto(
         await responder_texto(
             update,
             (
-                f"✅ Programación guardada para @{username}\n\n"
+                f"✅ Programación guardada para {nombre_visible_programacion(username)}\n\n"
                 f"⏱ Intervalo: {texto_intervalo}\n"
                 f"🕒 Minuto de la hora: :{minuto:02d}\n"
                 f"⏭ Próxima revisión: "
@@ -5368,7 +6031,7 @@ async def recibir_texto(
                 f"{'🔔 ACTIVADA' if notif else '🔕 DESACTIVADA'}\n\n"
                 f"{texto_modalidad_guardada(row_guardada)}"
             ),
-            reply_markup=menu_programaciones(),
+            reply_markup=menu_destinos_programacion(),
         )
         return
 
@@ -5409,6 +6072,12 @@ async def recibir_texto(
             )
             return
 
+        if not validar_destino_flujo(context):
+            context.user_data.clear()
+            await responder_texto(update, "El destino ya no existe o no tiene perfiles agregados. Volvé a elegirlo.",
+                                  reply_markup=menu_destinos_programacion())
+            return
+
         horarios.sort()
 
         db.guardar_programacion(
@@ -5439,14 +6108,17 @@ async def recibir_texto(
         )
 
         await responder_texto(update,
-            f"✅ Programación guardada para @{username}\n\n"
+            f"✅ Programación guardada para {nombre_visible_programacion(username)}\n\n"
             f"Horarios Argentina: {' · '.join(horarios)}\n"
             f"Multimedia automática: "
             f"{'🔔 ACTIVADA' if notif else '🔕 DESACTIVADA'}\n\n"
             f"{texto_modalidad_guardada(row_guardada)}",
-            reply_markup=menu_programaciones(),
+            reply_markup=menu_destinos_programacion(),
         )
         return
+
+    if estado is None and not context.user_data.get(backups.BACKUP_STATE):
+        await proponer_desde_texto(update, context, texto)
 
 
 async def error_global(
@@ -5504,12 +6176,16 @@ async def error_global(
 
 async def post_init(application: Application) -> None:
     db.inicializar()
+    await sincronizar_jobs_pausas(application)
+    await backups.iniciar(application, AUTHORIZED_CHAT_ID, TZ)
 
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Abrir StoryPulse"),
-        ]
-    )
+    await publicar_comandos_navegacion(application)
+    manager = obtener_navegacion(type('NavigationContext', (), {
+        'application': application, 'bot': application.bot})())
+    backups.configurar_navegacion(application, responder_texto=_respuesta_backup_navegacion,
+                                is_active=manager.is_active, enviar_aviso=_aviso_backup_navegacion,
+                                actualizar_menu=manager.editar_si_activo,
+                                navigation_generation=manager.active_generation)
 
     for row in db.listar_programaciones_activas():
         registrar_programacion_guardada(
@@ -5523,6 +6199,388 @@ async def post_init(application: Application) -> None:
     )
 
 
+def menu_detener_lote(control):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        '🛑 DETENER', callback_data='batch_stop:' + control.token, style='danger',
+    )]])
+
+
+def registrar_lote(chat_id, tipo, titulo, total, grupo_id=None):
+    control = ControlLote(int(chat_id), tipo, titulo, total, grupo_id)
+    LOTES_EN_CURSO[control.token] = control
+    return control
+
+
+def grupo_en_revision(chat_id, grupo_id):
+    return any(c.chat_id == int(chat_id) and c.grupo_id == grupo_id
+               and c.tipo in ('grupo_manual', 'grupo_programado')
+               for c in LOTES_EN_CURSO.values())
+
+
+async def callback_lotes(update, context):
+    """Despachar sólo lotes largos en segundo plano; el resto sigue secuencial."""
+    query = update.callback_query
+    if not query:
+        return
+    if not autorizado(update) or (query.data or '').startswith('batch_stop:'):
+        await callback(update, context)
+        return
+    context.application.create_task(callback(update, context), update=update)
+
+
+def menu_actualizar_asociaciones():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🔄 Actualizar todos', callback_data='associations_all')],
+        [InlineKeyboardButton('👤 Individual', callback_data='associations_individual')],
+        [InlineKeyboardButton('‹ Gestionar cuentas', callback_data='manage')],
+    ])
+
+
+async def mostrar_sesiones_asociaciones(context, query, pagina=0):
+    try:
+        sesiones = await asyncio.to_thread(listar_sesiones)
+        sesiones.sort(key=lambda s: (s.reserva, s.orden_reserva))
+    except ConfiguracionSesionesError as error:
+        await query.edit_message_text('ℹ️ ' + str(error), reply_markup=menu_actualizar_asociaciones())
+        return
+    paginas = max(1, (len(sesiones) + 9) // 10)
+    pagina = max(0, min(pagina, paginas - 1))
+    token = uuid.uuid4().hex[:12]
+    context.user_data['asociaciones_eleccion'] = {
+        'token': token, 'message_id': getattr(query.message, 'message_id', None),
+        'sesiones': sesiones,
+    }
+    filas = []
+    for indice in range(pagina * 10, min(len(sesiones), (pagina + 1) * 10)):
+        sesion = sesiones[indice]
+        etiqueta = sesion.etiqueta + (' · Reserva' if sesion.reserva else '')
+        filas.append([InlineKeyboardButton(etiqueta, callback_data=f'associations_pick:{token}:{indice}')])
+    navegacion = []
+    if pagina:
+        navegacion.append(InlineKeyboardButton('‹ Anterior', callback_data=f'associations_page:{pagina-1}'))
+    if pagina + 1 < paginas:
+        navegacion.append(InlineKeyboardButton('Siguiente ›', callback_data=f'associations_page:{pagina+1}'))
+    if navegacion:
+        filas.append(navegacion)
+    filas.append([InlineKeyboardButton('‹ Actualizar asociaciones', callback_data='associations_sync')])
+    await query.edit_message_text(
+        '👤 Actualizar asociaciones: Individual\n\nElegí una sesión. Se comprobará su acceso a todos los perfiles guardados, con los mismos controles, reintentos y opción de detener. No se consultarán las otras sesiones.',
+        reply_markup=InlineKeyboardMarkup(filas),
+    )
+
+
+def eleccion_asociaciones_valida(context, query, data):
+    partes = data.split(':')
+    seleccion = context.user_data.get('asociaciones_eleccion')
+    if (len(partes) != 3 or not isinstance(seleccion, dict)
+            or partes[1] != seleccion.get('token')
+            or seleccion.get('message_id') != getattr(query.message, 'message_id', None)
+            or not partes[2].isascii() or not partes[2].isdigit() or len(partes[2]) > 5):
+        return None
+    indice = int(partes[2])
+    sesiones = seleccion.get('sesiones')
+    if not isinstance(sesiones, list) or not 0 <= indice < len(sesiones):
+        return None
+    return sesiones[indice]
+
+
+async def callback_control_lotes(context, query, data):
+    if data.startswith('batch_stop:'):
+        control = LOTES_EN_CURSO.get(data.split(':', 1)[1])
+        if control is None or control.chat_id != int(query.message.chat.id):
+            await query.edit_message_reply_markup(reply_markup=None)
+            return True
+        control.detener.set()
+        async with control.edicion:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                logger.warning('No se pudo retirar el botón de detención.')
+        await enviar_texto_bot(context, chat_id=control.chat_id,
+            text='🛑 Deteniendo ' + control.titulo + '…\n'
+                 'Se terminará de guardar el perfil o la comprobación en curso. No se iniciará el siguiente.',
+            disable_notification=True)
+        return True
+    if data == 'associations_sync':
+        await query.edit_message_text('🔄 Actualizar asociaciones\n\nElegí el alcance de la comprobación.', reply_markup=menu_actualizar_asociaciones())
+        return True
+    if data == 'associations_all':
+        context.user_data.pop('asociaciones_eleccion', None)
+        await actualizar_asociaciones_bot(context, query)
+        return True
+    if data == 'associations_individual':
+        await mostrar_sesiones_asociaciones(context, query)
+        return True
+    if data.startswith('associations_page:'):
+        value = data.split(':', 1)[1]
+        if value.isascii() and value.isdigit() and len(value) <= 5:
+            await mostrar_sesiones_asociaciones(context, query, int(value))
+        return True
+    if data.startswith('associations_pick:'):
+        elegida = eleccion_asociaciones_valida(context, query, data)
+        if elegida is None:
+            await query.edit_message_text('ℹ️ Esta selección venció. Volvé a elegir una sesión.', reply_markup=menu_actualizar_asociaciones())
+            return True
+        context.user_data.pop('asociaciones_eleccion', None)
+        await actualizar_asociaciones_bot(context, query, sesion_esperada=elegida)
+        return True
+    if data == 'associations_retry':
+        await actualizar_asociaciones_bot(context, query, reintentar=True)
+        return True
+    return False
+
+
+@scoped_operation
+async def revisar_cuentas_grupo(context, query, grupo_id=None):
+    if DESTACADAS_REVIEW_LOCK.locked() or (grupo_id is not None and grupo_en_revision(AUTHORIZED_CHAT_ID, grupo_id)):
+        await enviar_texto_bot(context, chat_id=AUTHORIZED_CHAT_ID,
+            borrar_en=AVISO_BORRADO_SEGUNDOS,
+            text='ℹ️ Ya hay una revisión de grupo en curso.', disable_notification=True)
+        return
+    grupo = db.obtener_grupo_cuentas(AUTHORIZED_CHAT_ID, grupo_id) if grupo_id is not None else None
+    titulo = grupo['nombre'] if grupo else 'Cuentas Favoritas'
+    total = len(set(grupo['usuarios'])) if grupo else sum(c.get('destacada') is True for c in cargar_cuentas())
+    control = registrar_lote(AUTHORIZED_CHAT_ID, 'grupo_manual' if grupo_id is not None else 'favoritas',
+                             titulo, total, grupo_id)
+    try:
+        with usar_lote(control), usar_solo_sesiones_asociadas(grupo_id is not None):
+            await _revisar_cuentas_grupo_lote(context, query, grupo_id, control=control)
+    finally:
+        LOTES_EN_CURSO.pop(control.token, None)
+
+
+async def esperar_tarea_hilo(tarea, detener):
+    """No liberar IG_LOCK mientras Playwright sigue en un hilo cancelado."""
+    try:
+        return await asyncio.shield(tarea)
+    except asyncio.CancelledError:
+        detener.set()
+        while not tarea.done():
+            try:
+                await asyncio.shield(tarea)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not tarea.cancelled():
+            tarea.exception()
+        raise
+
+
+async def actualizar_asociaciones_bot(context, query, *, reintentar=False, sesion_esperada=None):
+    if reintentar and sesion_esperada is None:
+        try:
+            sesion_esperada = await asyncio.to_thread(sesion_para_reintentar_asociaciones)
+        except ConfiguracionSesionesError as error:
+            await query.edit_message_text('ℹ️ ' + str(error), reply_markup=menu_actualizar_asociaciones())
+            return
+
+    if any(c.tipo == 'asociaciones' for c in LOTES_EN_CURSO.values()):
+        await enviar_texto_bot(context, chat_id=AUTHORIZED_CHAT_ID,
+            text='ℹ️ Ya hay una actualización de asociaciones en curso.', disable_notification=True)
+        return
+    cuentas = cargar_cuentas()
+    usernames = list(dict.fromkeys(c['username'] for c in cuentas))
+    if not usernames:
+        await query.edit_message_text('ℹ️ No hay perfiles agregados para comprobar.', reply_markup=menu_gestion())
+        return
+    ids = {c['username']: c.get('user_id') for c in cuentas}
+    control = registrar_lote(AUTHORIZED_CHAT_ID, 'asociaciones', 'la actualización de asociaciones', len(usernames))
+    estado = {}
+    estado_lock = threading.Lock()
+    inicio = time.monotonic()
+
+    def recibir(datos):
+        with estado_lock:
+            estado.update(datos)
+
+    def texto():
+        with estado_lock:
+            datos = dict(estado)
+        if not datos:
+            return '⏳ Actualizando asociaciones…\nEsperando turno si hay una consulta en curso.'
+        actual = datos.get('username_actual')
+        consulta = ('@' + actual) if actual else 'Preparando comprobación'
+        return (f"⏳ Actualizando asociaciones\n\nSesión: {datos.get('sesion_actual') or '—'}\n"
+                f"Perfil: {consulta}\n🕒 Tiempo: {int(time.monotonic() - inicio)} s\n"
+                f"🔎 Comprobaciones: {datos['comprobadas']}/{datos['total']}\n"
+                f"✅ Accesos confirmados: {datos['confirmadas']}\n"
+                f"➕ Asociaciones añadidas: {datos['añadidas']}\n"
+                f"➖ Asociaciones eliminadas: {datos['eliminadas']}\n"
+                f"🔒 Sin acceso confirmado: {datos['sin_acceso']}\n"
+                f"⚠️ No se pudieron comprobar: {datos['fallidas']}\n"
+                f"📋 Pendientes: {datos['pendientes']}\n"
+                f"♻️ Reintentos en esta ejecución: {datos.get('reintentos_ejecucion', 0)}\n"
+                f"🔁 Pasada: {datos.get('pasada', 1)}")
+
+    async def mostrar():
+        async with control.edicion:
+            await query.edit_message_text(texto(), reply_markup=None if control.detener.is_set() else menu_detener_lote(control))
+
+    async def refrescar():
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await mostrar()
+            except TelegramError:
+                logger.warning('No se pudo actualizar el progreso de asociaciones.')
+
+    def ejecutar_sincronizacion():
+        from contextlib import contextmanager
+        @contextmanager
+        def verificador():
+            with comprobar_perfiles_desde_pagina() as verificar:
+                yield lambda username: verificar(username, user_id=ids.get(username))
+        opciones = {'reintentar_pendientes': True} if reintentar else {}
+        if sesion_esperada is not None:
+            opciones['sesion_esperada'] = sesion_esperada
+        return sincronizar_asociaciones(usernames, verificador, detener=control.detener, progreso=recibir, **opciones)
+
+    tarea_progreso = None
+    try:
+        await mostrar()
+        tarea_progreso = asyncio.create_task(refrescar())
+        async with IG_LOCK:
+            tarea = asyncio.create_task(asyncio.to_thread(ejecutar_sincronizacion))
+            resultado = await esperar_tarea_hilo(tarea, control.detener)
+        tarea_progreso.cancel()
+        try:
+            await tarea_progreso
+        except asyncio.CancelledError:
+            pass
+        cabecera = ('🛑 Actualización detenida' if resultado['detenida'] else
+                    '⚠️ Actualización interrumpida' if resultado['interrumpida'] else
+                    '⚠️ Actualización parcial' if resultado['pendientes'] else '✅ Asociaciones actualizadas')
+        resumen = (f"{cabecera}\n\n🔎 Comprobaciones: {resultado['comprobadas']}/{resultado['total']}\n"
+                   f"✅ Accesos confirmados: {resultado['confirmadas']}\n"
+                   f"➕ Asociaciones añadidas: {resultado['añadidas']}\n"
+                   f"➖ Asociaciones eliminadas: {resultado['eliminadas']}\n"
+                   f"🔒 Sin acceso confirmado: {resultado['sin_acceso']}\n"
+                   f"⚠️ No se pudieron comprobar: {resultado['fallidas']}\n"
+                   f"📋 Pendientes: {resultado['pendientes']}\n"
+                   f"♻️ Reintentos en esta ejecución: {resultado.get('reintentos_ejecucion', 0)}\n"
+                   f"⏭️ Sesiones omitidas: {len(resultado['sesiones_omitidas'])}\n"
+                   f"⚖️ Preferidas repartidas: {resultado.get('preferidas_repartidas', 0)}\n"
+                   f"🔄 Preferidas cambiadas: {resultado.get('preferidas_cambiadas', 0)}\n"
+                   f"🔑 Preferidas de reserva: {resultado.get('preferidas_reserva', 0)}")
+        if resultado['motivo']:
+            resumen += '\n\n' + resultado['motivo']
+        if sesion_esperada is not None:
+            resumen += '\n\nSe comprobó únicamente la sesión elegida. Las asociaciones de otras sesiones y las preferidas vigentes se conservan; una denegación explícita puede retirar el acceso de la sesión elegida.'
+        else:
+            resumen += '\n\nLas habituales se verifican primero y las reservas al final. Las preferidas se reparten entre accesos confirmados. Las asociaciones no comprobadas se conservan.'
+        if resultado['pendientes']:
+            resumen += '\nLos resultados quedan guardados. Usá «Reintentar asociaciones pendientes» para consultar sólo lo que falta.'
+        await enviar_menu_al_final(context, query, resumen, reply_markup=menu_gestion())
+    except ConfiguracionSesionesError as error:
+        await enviar_menu_al_final(context, query, 'ℹ️ ' + str(error), reply_markup=menu_gestion())
+    except Exception:
+        logger.exception('No se pudo completar la sincronización de asociaciones.')
+        await enviar_menu_al_final(context, query,
+            '⚠️ No se pudo completar la actualización. Se conservaron las asociaciones no comprobadas y los cambios ya confirmados.',
+            reply_markup=menu_gestion())
+    finally:
+        control.detener.set()
+        if tarea_progreso is not None:
+            tarea_progreso.cancel()
+            try:
+                await tarea_progreso
+            except asyncio.CancelledError:
+                pass
+        LOTES_EN_CURSO.pop(control.token, None)
+
+
+@scoped_operation
+async def ejecutar_grupo_programado(context, row):
+    chat_id, grupo_id = int(row['chat_id']), db.grupo_id_programacion(row)
+    clave = str(row['username'])
+    identidad = (chat_id, grupo_id)
+    if identidad in GRUPOS_PROGRAMADOS_EN_CURSO or grupo_en_revision(chat_id, grupo_id):
+        logger.info('El grupo %s ya tiene una revisión en curso.', grupo_id)
+        return
+    grupo = db.obtener_grupo_cuentas(chat_id, grupo_id)
+    if grupo is None:
+        db.eliminar_programacion(chat_id, clave)
+        eliminar_jobs_usuario(context.application, chat_id, clave)
+        return
+    miembros = integrantes_programables(grupo)
+    control = registrar_lote(chat_id, 'grupo_programado', grupo['nombre'], len(miembros), grupo_id)
+    GRUPOS_PROGRAMADOS_EN_CURSO.add(identidad)
+    revisados = nuevas = vacios = fallos = omitidos = sin_sesion = 0
+    mensaje = None
+
+    def resumen(cabecera):
+        return (f"{cabecera}\n\n👤 Perfiles revisados: {revisados}/{len(miembros)}\n"
+                f"📥 Historias nuevas procesadas: {nuevas}\nℹ️ Sin historias nuevas: {vacios}\n"
+                f"⚠️ Perfiles con error: {fallos}\n🔑 Sin sesión asociada disponible: {sin_sesion}\n"
+                f"↪️ Omitidos: {omitidos}\n📋 Pendientes: {len(miembros) - revisados - omitidos}")
+
+    try:
+        try:
+            mensaje = await enviar_texto_bot(context, chat_id=chat_id,
+                text=resumen('⏳ Revisión programada de ' + grupo['nombre']),
+                reply_markup=menu_detener_lote(control), disable_notification=True)
+        except TelegramError:
+            logger.warning('No se pudo mostrar el control del grupo programado.')
+        with usar_lote(control), usar_solo_sesiones_asociadas():
+            for username in miembros:
+                if control.detener.is_set():
+                    break
+                vigente = db.obtener_programacion(chat_id, clave)
+                actual = db.obtener_grupo_cuentas(chat_id, grupo_id)
+                if vigente is None or not bool(vigente['activa']) or actual is None:
+                    control.detener.set()
+                    break
+                if username not in actual['usuarios'] or buscar_cuenta(username) is None:
+                    omitidos += 1
+                    continue
+                if mensaje is not None:
+                    try:
+                        async with control.edicion:
+                            await context.bot.edit_message_text(chat_id=chat_id, message_id=mensaje.message_id,
+                                text=resumen(f"⏳ Revisando {grupo['nombre']}: @{username}"),
+                                reply_markup=None if control.detener.is_set() else menu_detener_lote(control))
+                    except TelegramError:
+                        logger.warning('No se pudo actualizar el progreso del grupo programado.')
+                tarea = asyncio.create_task(revisar_usuario(context, chat_id, username,
+                                                            manual=False, programacion_grupo=vigente))
+                try:
+                    cantidad = await esperar_tarea_hilo(tarea, control.detener)
+                except LoteDetenido:
+                    break
+                except SinSesionAsociadaDisponible:
+                    sin_sesion += 1
+                except SinHistoriasDisponibles:
+                    vacios += 1
+                except Exception as error:
+                    fallos += 1
+                    logger.exception('Error en el grupo %s, perfil @%s', grupo_id, username)
+                    try:
+                        await avisar_error_chat(context, chat_id, username, error, automatico=True)
+                    except TelegramError:
+                        logger.warning('No se pudo informar el error del grupo programado.')
+                else:
+                    nuevas += cantidad
+                    if getattr(cantidad, 'portadas_pendientes', 0):
+                        fallos += 1
+                    elif cantidad == 0:
+                        vacios += 1
+                revisados += 1
+        cabecera = ('🛑 Revisión detenida: ' if control.detener.is_set() else '✅ Revisión completada: ') + grupo['nombre']
+        await enviar_texto_bot(context, chat_id=chat_id, text=resumen(cabecera),
+                              reply_markup=menu_grupos(), disable_notification=True)
+    finally:
+        LOTES_EN_CURSO.pop(control.token, None)
+        GRUPOS_PROGRAMADOS_EN_CURSO.discard(identidad)
+        if mensaje is not None:
+            try:
+                await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=mensaje.message_id, reply_markup=None)
+                programar_borrado_aviso(context, mensaje, controles_retirados=True)
+            except TelegramError:
+                logger.warning('No se pudo retirar el control del grupo programado.')
+
+
+
 def main() -> None:
     db.inicializar()
 
@@ -5534,7 +6592,13 @@ def main() -> None:
     )
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler([nombre for nombre, _, _ in COMANDOS_NAVEGACION] + ['menu'], comando_atajo)
+    )
+    application.add_handler(
+        CallbackQueryHandler(callback_sugerencia, pattern=r"^nlp_pick:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(callback_lotes, pattern=r"^(?:review_featured|group_review:[0-9]+|associations_sync|associations_all|associations_individual|associations_pick:[a-f0-9]{12}:[0-9]{1,5}|associations_retry|batch_stop:[a-f0-9]{12})$")
     )
     application.add_handler(
         CallbackQueryHandler(callback)
@@ -5566,6 +6630,237 @@ def main() -> None:
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
+
+
+
+
+
+PAUSE_SELECTION = 'pausa_seleccion'
+PAUSE_DURATION = 'pausa_duracion'
+PAUSE_DATE = 'pausa_fecha'
+PAUSE_JOB_PREFIX = 'sesion_reanudar:'
+
+
+def texto_pausa_sesion(pausa: dict) -> str:
+    if pausa.get('reanudar_en') is None:
+        return 'Pausada hasta reanudarla manualmente.'
+    fecha = datetime.fromisoformat(pausa['reanudar_en']).astimezone(TZ)
+    return f"Pausada hasta el {fecha:%d/%m/%Y %H:%M} (hora de Argentina)."
+
+
+async def job_reanudar_sesiones(context) -> None:
+    vencidas = await asyncio.to_thread(reanudar_pausas_vencidas)
+    if vencidas:
+        logger.info('Pausas de sesiones vencidas: %s', len(vencidas))
+    await sincronizar_jobs_pausas(context.application)
+
+
+async def sincronizar_jobs_pausas(application) -> None:
+    await asyncio.to_thread(reanudar_pausas_vencidas)
+    pausas = await asyncio.to_thread(listar_pausas_sesiones)
+    queue = getattr(application, 'job_queue', None)
+    if queue is None:
+        return
+    for job in queue.jobs():
+        if job.name and job.name.startswith(PAUSE_JOB_PREFIX):
+            job.schedule_removal()
+    for identificador, pausa in pausas.items():
+        if pausa['reanudar_en'] is not None:
+            fecha = datetime.fromisoformat(pausa['reanudar_en'])
+            cuando = fecha if fecha > datetime.now(timezone.utc) else 0
+            queue.run_once(job_reanudar_sesiones, when=cuando, name=PAUSE_JOB_PREFIX+identificador)
+
+
+async def mostrar_menu_pausas(context, query, pagina=0, aviso='') -> None:
+    estados = await asyncio.to_thread(estado_sesiones_local)
+    sesiones = await asyncio.to_thread(listar_sesiones, incluir_deshabilitadas=True)
+    posiciones = {s.id: s for s in sesiones}
+    estados = [fila for fila in estados if fila['id'] in posiciones]
+    paginas = max(1, (len(estados)+9)//10)
+    pagina = max(0, min(pagina, paginas-1))
+    token = uuid.uuid4().hex[:12]
+    context.user_data.clear()
+    context.user_data[PAUSE_SELECTION] = {
+        'token': token, 'message_id': getattr(query.message, 'message_id', None),
+        'sesiones': [posiciones[fila['id']] for fila in estados], 'pagina': pagina,
+    }
+    filas = []
+    for indice in range(pagina*10, min(len(estados), (pagina+1)*10)):
+        estado = estados[indice]
+        icono = '🟡' if estado['pausada'] else '🟢' if estado['disponible'] else '🔴'
+        nombre = 'Pausada' if estado['pausada'] else 'Activa' if estado['habilitada'] else 'Deshabilitada'
+        filas.append([InlineKeyboardButton(f"{icono} {estado['etiqueta']} · {nombre}",
+                      callback_data=f'pauses_pick:{token}:{indice}')])
+    navegacion = []
+    if pagina:
+        navegacion.append(InlineKeyboardButton('‹ Anterior', callback_data=f'pauses_page:{pagina-1}'))
+    if pagina+1 < paginas:
+        navegacion.append(InlineKeyboardButton('Siguiente ›', callback_data=f'pauses_page:{pagina+1}'))
+    if navegacion:
+        filas.append(navegacion)
+    filas.append([InlineKeyboardButton('‹ Gestionar cuentas', callback_data='manage')])
+    texto = '⏸️ <b>Pausar/reanudar sesiones</b>\n\n'
+    if aviso:
+        texto += esc(aviso)+'\n\n'
+    texto += ('Elegí una sesión. La pausa se aplica a todas las consultas del bot.\n'
+              'Una sesión pausada conserva sus cookies y asociaciones.') if estados else 'No hay sesiones configuradas.'
+    await query.edit_message_text(texto, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(filas))
+
+
+def seleccion_pausa_valida(context, query, token: str, *, elegida=False):
+    seleccion = context.user_data.get(PAUSE_SELECTION)
+    if (not isinstance(seleccion, dict) or seleccion.get('token') != token or
+            seleccion.get('message_id') != getattr(query.message, 'message_id', None)):
+        return None
+    if elegida and seleccion.get('elegida') is None:
+        return None
+    return seleccion
+
+
+async def mostrar_detalle_pausa(context, query, seleccion) -> None:
+    sesion = seleccion['elegida']
+    token = seleccion['token']
+    estados = await asyncio.to_thread(estado_sesiones_local)
+    estado = next((fila for fila in estados if fila['id'] == sesion.id), None)
+    if estado is None:
+        await mostrar_menu_pausas(context, query, aviso='Esa sesión ya no existe.')
+        return
+    texto = f"⏸️ <b>{esc(sesion.etiqueta)}</b>\n\n"
+    pausa = await asyncio.to_thread(estado_pausa_sesion, sesion.id)
+    texto += esc(texto_pausa_sesion(pausa) if pausa else estado['detalle'])+'\n\n'
+    if estado.get('ultimo_error_tipo') == 'verificacion':
+        texto += '🔴 CAPTCHA/verificación pendiente. Reanudar no elimina ese requisito.\n\n'
+    filas = []
+    if pausa:
+        filas.append([InlineKeyboardButton('▶️ Reanudar sesión', callback_data=f'pauses_action:{token}:resume', style='success')])
+    elif estado['habilitada']:
+        filas.append([InlineKeyboardButton('⏸️ Pausar sesión', callback_data=f'pauses_action:{token}:pause')])
+    if estado['habilitada']:
+        filas.append([InlineKeyboardButton('⏰ Programar pausado', callback_data=f'pauses_action:{token}:schedule')])
+    filas.append([InlineKeyboardButton('‹ Elegir otra sesión', callback_data='sessions_pause')])
+    filas.append([InlineKeyboardButton('‹ Gestionar cuentas', callback_data='manage')])
+    await query.edit_message_text(texto, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(filas))
+
+
+def menu_duracion_pausa(token: str):
+    botones = []
+    for unidad, valores in [('h', [1, 2, 3, 5]), ('d', [1, 2, 3, 5, 7, 14])]:
+        for valor in valores:
+            nombre = (f'{valor} hora' if valor == 1 else f'{valor} horas') if unidad == 'h' else (
+                '1 semana' if valor == 7 else '2 semanas' if valor == 14 else f'{valor} día' if valor == 1 else f'{valor} días')
+            botones.append(InlineKeyboardButton(nombre, callback_data=f'pauses_for:{token}:{unidad}:{valor}'))
+    filas = [botones[i:i+2] for i in range(0, len(botones), 2)]
+    filas.append([InlineKeyboardButton('✍️ Otra duración', callback_data=f'pauses_action:{token}:duration')])
+    filas.append([InlineKeyboardButton('📅 Hasta una fecha y hora', callback_data=f'pauses_action:{token}:date')])
+    filas.append([InlineKeyboardButton('Cancelar', callback_data='sessions_pause')])
+    return InlineKeyboardMarkup(filas)
+
+
+async def aplicar_cambio_pausa(context, query, seleccion, *, hasta=None, reanudar=False):
+    sesion = seleccion['elegida']
+    await query.edit_message_text('⏳ Aplicando el cambio. Si hay una consulta en curso, esperando a que termine.')
+    try:
+        async with IG_LOCK:
+            if reanudar:
+                await asyncio.to_thread(reanudar_sesion, sesion.id, sesion_esperada=sesion)
+            else:
+                await asyncio.to_thread(pausar_sesion, sesion.id, hasta, sesion_esperada=sesion)
+        await sincronizar_jobs_pausas(context.application)
+    except (ConfiguracionSesionesError, ValueError) as error:
+        await mostrar_menu_pausas(context, query, aviso='❌ '+str(error))
+        return
+    aviso = '▶️ Sesión reanudada. Se mantienen los requisitos de autenticación pendientes.' if reanudar else '⏸️ Sesión pausada. '+texto_pausa_sesion({'reanudar_en': hasta.isoformat() if hasta else None})
+    await mostrar_menu_pausas(context, query, seleccion.get('pagina', 0), aviso)
+
+
+async def callback_pausas_sesiones(context, query, data: str) -> bool:
+    if data == 'sessions_pause' or data.startswith('pauses_page:'):
+        try:
+            pagina = int(data.split(':', 1)[1]) if ':' in data else 0
+        except ValueError:
+            pagina = 0
+        await mostrar_menu_pausas(context, query, pagina)
+        return True
+    if not data.startswith(('pauses_pick:', 'pauses_action:', 'pauses_for:')):
+        return False
+    partes = data.split(':')
+    seleccion = seleccion_pausa_valida(context, query, partes[1] if len(partes)>1 else '',
+                                      elegida=partes[0] != 'pauses_pick')
+    if seleccion is None:
+        await mostrar_menu_pausas(context, query, aviso='La selección venció. Elegí la sesión nuevamente.')
+        return True
+    context.user_data.pop(STATE, None)
+    if partes[0] == 'pauses_pick':
+        if len(partes) != 3 or not partes[2].isdigit() or int(partes[2]) >= len(seleccion['sesiones']):
+            await mostrar_menu_pausas(context, query, aviso='Selección inválida.')
+        else:
+            seleccion['elegida'] = seleccion['sesiones'][int(partes[2])]
+            await mostrar_detalle_pausa(context, query, seleccion)
+        return True
+    if partes[0] == 'pauses_for':
+        if len(partes) != 4 or partes[2] not in {'h', 'd'} or not partes[3].isdigit() or not 1 <= int(partes[3]) <= 365:
+            await mostrar_menu_pausas(context, query, aviso='Duración inválida.')
+        else:
+            segundos = int(partes[3])*(3600 if partes[2] == 'h' else 86400)
+            await aplicar_cambio_pausa(context, query, seleccion, hasta=datetime.now(timezone.utc)+timedelta(seconds=segundos))
+        return True
+    accion = partes[2] if len(partes) == 3 else ''
+    if accion in {'pause', 'resume'}:
+        await aplicar_cambio_pausa(context, query, seleccion, reanudar=accion == 'resume')
+    elif accion == 'schedule':
+        await query.edit_message_text('⏰ La sesión se pausará al elegir la duración. ¿Cuándo debe reanudarse?',
+                                      reply_markup=menu_duracion_pausa(seleccion['token']))
+    elif accion in {'duration', 'date'}:
+        context.user_data[STATE] = PAUSE_DURATION if accion == 'duration' else PAUSE_DATE
+        seleccion['query'] = query
+        texto = 'Escribí la duración. Ejemplos: 12h o 3d.' if accion == 'duration' else 'Escribí la fecha y hora de reanudación en Argentina.\nFormato: DD/MM/AAAA HH:MM.'
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('Cancelar', callback_data='sessions_pause')]]))
+    else:
+        await mostrar_menu_pausas(context, query, aviso='Acción inválida.')
+    return True
+
+
+def interpretar_fecha_pausa(texto: str, estado: str) -> datetime:
+    ahora = datetime.now(timezone.utc)
+    if estado == PAUSE_DURATION:
+        match = re.fullmatch(r'\s*(\d+)\s*(h|horas?|d|d[ií]as?)\s*', texto, re.I)
+        if match is None:
+            raise ValueError('Usá horas o días. Ejemplos: 12h o 3d.')
+        cantidad = int(match.group(1))
+        if not 1 <= cantidad <= 8760:
+            raise ValueError('La cantidad debe estar entre 1 y 8760.')
+        segundos = cantidad*(3600 if match.group(2).casefold().startswith('h') else 86400)
+        if segundos > 365*86400:
+            raise ValueError('La pausa no puede superar 365 días.')
+        return ahora+timedelta(seconds=segundos)
+    try:
+        fecha = datetime.strptime(texto, '%d/%m/%Y %H:%M').replace(tzinfo=TZ).astimezone(timezone.utc)
+    except ValueError:
+        raise ValueError('Formato inválido. Usá DD/MM/AAAA HH:MM.') from None
+    if fecha <= ahora:
+        raise ValueError('La fecha debe estar en el futuro.')
+    return fecha
+
+
+async def recibir_texto_pausa(update, context, texto: str, estado: str) -> bool:
+    if estado not in {PAUSE_DURATION, PAUSE_DATE}:
+        return False
+    seleccion = context.user_data.get(PAUSE_SELECTION, {})
+    query = seleccion.get('query')
+    if query is None or seleccion_pausa_valida(context, query, seleccion.get('token', ''), elegida=True) is None:
+        context.user_data.clear()
+        await responder_texto(update, 'La selección venció. Abrí Pausar/reanudar sesiones nuevamente.', reply_markup=menu_gestion())
+        return True
+    try:
+        fecha = interpretar_fecha_pausa(texto, estado)
+    except ValueError as error:
+        await responder_texto(update, str(error), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('Cancelar', callback_data='sessions_pause')]]))
+        return True
+    context.user_data.pop(STATE, None)
+    await aplicar_cambio_pausa(context, query, seleccion, hasta=fecha)
+    return True
 
 
 if __name__ == "__main__":

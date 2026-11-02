@@ -1,0 +1,17 @@
+{
+  "winscp_exe": "",
+  "vps_host": "",
+  "vps_user": "",
+  "puerto": 22,
+  "ssh_hostkey": "",
+  "auth_mode": "password",
+  "password": "",
+  "password_env": "STORYPULSE_VPS_PASSWORD",
+  "ppk_file": "",
+  "ppk_passphrase": "",
+  "ppk_passphrase_env": "STORYPULSE_PPK_PASSPHRASE",
+  "remote_dir": "",
+  "remote_owner": "",
+  "service_name": "",
+  "remote_python": ""
+}

@@ -1,9 +1,18 @@
-# StoryPulse v2.0
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
+"""Sesiones independientes, selección por perfil y estado persistente.
 
-
+Las cookies permanecen exclusivamente en los archivos storage_state.
+Una verificación de seguridad se resuelve manualmente; no se automatiza.
+"""
 from __future__ import annotations
+
+import session_pauses as politica_pausas
+from session_aliases import validar_aliases
 
 import hashlib
 import json
@@ -50,7 +59,6 @@ def _cargar_entorno_sesiones_sin_dotenv(ruta: Path) -> None:
             valor = citado.group(2)
         else:
             valor = re.split(r"\s+#", valor, maxsplit=1)[0].strip()
-        # No usar una ruta incorrecta si la configuración requiere interpolación.
         if "${" in valor:
             raise RuntimeError(
                 f"La variable {nombre} usa interpolación en .env. "
@@ -135,11 +143,18 @@ class SesionesAgotadas(RuntimeError):
         )
 
 
+class SinSesionAsociadaDisponible(SesionesAgotadas):
+    """El lote no descubre accesos: sólo usa asociaciones existentes."""
+    pass
+
+
 @dataclass(frozen=True)
 class SesionInstagram:
     id: str
     username: str | None
     archivo: Path
+    reserva: bool = False
+    orden_reserva: int = 0
 
     @property
     def etiqueta(self) -> str:
@@ -149,6 +164,18 @@ class SesionInstagram:
 _ACTUAL: ContextVar[SesionInstagram | None] = ContextVar("sesion_instagram", default=None)
 _VERIFICACION_MANUAL: ContextVar[tuple[str, str] | None] = ContextVar(
     "verificacion_manual_instagram", default=None)
+
+
+_SOLO_ASOCIADAS: ContextVar[bool] = ContextVar("solo_sesiones_asociadas", default=False)
+
+
+@contextmanager
+def usar_solo_sesiones_asociadas(activo: bool = True):
+    token = _SOLO_ASOCIADAS.set(_SOLO_ASOCIADAS.get() or activo)
+    try:
+        yield
+    finally:
+        _SOLO_ASOCIADAS.reset(token)
 
 
 def _ruta_env(nombre: str, defecto: str) -> Path:
@@ -185,7 +212,7 @@ def escribir_json_atomico(ruta: Path, contenido: Any) -> None:
         temporal.unlink(missing_ok=True)
 
 
-def listar_sesiones(*, incluir_deshabilitadas: bool = False) -> list[SesionInstagram]:
+def listar_sesiones(*, incluir_deshabilitadas: bool = False, incluir_pausadas: bool = False) -> list[SesionInstagram]:
     ruta = ruta_configuracion()
     if not ruta.exists():
         filas = [{"id": "principal", "archivo": None}]
@@ -193,10 +220,17 @@ def listar_sesiones(*, incluir_deshabilitadas: bool = False) -> list[SesionInsta
         config = _leer_json(ruta)
         if not isinstance(config, dict) or config.get("version") != 1:
             raise ConfiguracionSesionesError("sesiones_instagram.json necesita version=1.")
+        try:
+            aliases = validar_aliases(config)
+        except ValueError as error:
+            raise ConfiguracionSesionesError(str(error)) from error
         filas = config.get("sesiones")
         if not isinstance(filas, list):
             raise ConfiguracionSesionesError("La configuración necesita una lista sesiones.")
+        filas = [f for f in filas if not isinstance(f, dict) or str(f.get('id', '')).strip().lower() not in aliases]
 
+    with LOCK:
+        pausas = {} if incluir_pausadas or incluir_deshabilitadas else _politica_pausas()
     resultado = []
     ids: set[str] = set()
     archivos: set[str] = set()
@@ -228,11 +262,25 @@ def listar_sesiones(*, incluir_deshabilitadas: bool = False) -> list[SesionInsta
         if clave_archivo in archivos:
             raise ConfiguracionSesionesError("Dos sesiones apuntan al mismo archivo de cookies.")
         archivos.add(clave_archivo)
-        if habilitada or incluir_deshabilitadas:
-            resultado.append(SesionInstagram(identificador, username, ruta_state))
-    if not resultado and not incluir_deshabilitadas:
-        raise ConfiguracionSesionesError("No hay sesiones de Instagram habilitadas.")
+        if incluir_deshabilitadas or habilitada and (incluir_pausadas or politica_pausas.pausa_vigente(pausas, identificador) is None):
+            reserva = fila.get("reserva", False)
+            orden_reserva = fila.get("orden_reserva", 0)
+            if not isinstance(reserva, bool) or isinstance(orden_reserva, bool) or not isinstance(orden_reserva, int) or not 0 <= orden_reserva <= 1000:
+                raise ConfiguracionSesionesError("La prioridad de reserva de una sesión es inválida.")
+            resultado.append(SesionInstagram(identificador, username, ruta_state, reserva, orden_reserva))
+    if not resultado and not (incluir_deshabilitadas or incluir_pausadas):
+        raise ConfiguracionSesionesError("No hay sesiones de Instagram disponibles: están pausadas o deshabilitadas.")
     return resultado
+
+
+def ordenar_sesiones_por_prioridad(sesiones, preferida=None, *, conservar_orden=False):
+    """Habituales primero; las reservas nunca adelantan a una habitual."""
+    normales = [s for s in sesiones if not s.reserva]
+    reservas = [s for s in sesiones if s.reserva]
+    if not conservar_orden:
+        normales.sort(key=lambda s: s.id != preferida)
+        reservas.sort(key=lambda s: (s.id != preferida, s.orden_reserva))
+    return normales + reservas
 
 
 def sesion_actual() -> SesionInstagram | None:
@@ -241,11 +289,14 @@ def sesion_actual() -> SesionInstagram | None:
 
 def obtener_ruta_sesion() -> Path:
     actual = sesion_actual()
+    if actual is not None:
+        comprobar_sesion_habilitada(actual)
     return actual.archivo if actual else listar_sesiones()[0].archivo
 
 
 @contextmanager
 def usar_sesion(sesion: SesionInstagram):
+    comprobar_sesion_habilitada(sesion)
     token = _ACTUAL.set(sesion)
     try:
         yield
@@ -276,7 +327,6 @@ def comprobar_archivo_sesion() -> dict[str, Any]:
 
 
 def guardar_estado_contexto(context) -> None:
-    # Pedir el estado en memoria evita un temporal compartido entre cuentas.
     try:
         estado = context.storage_state(indexed_db=True)
     except TypeError:
@@ -285,7 +335,6 @@ def guardar_estado_contexto(context) -> None:
 
 
 def _tipo_verificacion(valor: Any) -> str | None:
-    # Sólo campos de errores: nunca buscar "challenge" en contenido del perfil.
     if not isinstance(valor, dict):
         return None
     textos = [str(valor.get(k, "")) for k in
@@ -329,7 +378,6 @@ def validar_respuesta_instagram(page, response, operacion: str) -> None:
     if response is None:
         raise ErrorConsultaInstagram(f"Instagram no devolvió respuesta al {operacion}.")
     status = int(response.status)
-    # El cuerpo puede indicar challenge_required incluso con HTTP 200 o 400.
     if status >= 400:
         try:
             data = response.json()
@@ -363,8 +411,6 @@ def _registro() -> dict[str, Any]:
             not isinstance(registro.get("perfiles"), dict) or
             not isinstance(registro.get("sesiones"), dict)):
         raise ConfiguracionSesionesError("Registro de sesiones inválido; revisar estado_sesiones_instagram.json.")
-    # Retirar los temporizadores de versiones anteriores, preservando accesos
-    # y requisitos reales de renovación. Ningún error HTTP fija una espera.
     cambios = "pausa_preventiva" in registro
     registro.pop("pausa_preventiva", None)
     for estado in registro["sesiones"].values():
@@ -391,7 +437,7 @@ def _exito(sesion: SesionInstagram, username: str, vincular: bool, *,
     registro["sesiones"][sesion.id] = {"huella": _huella(sesion), "ultimo_exito": _ahora(), "tipo": "disponible"}
     if vincular:
         anterior = registro["perfiles"].get(username, {})
-        mantener_preferida = (conservar_preferida or anterior.get("preferida_manual") is True) and anterior.get("sesion_id")
+        mantener_preferida = (conservar_preferida or anterior.get("preferida_manual") is True or anterior.get("preferida_balanceada") is True) and anterior.get("sesion_id")
         registro["perfiles"][username] = {
             **anterior,
             "sesion_id": anterior["sesion_id"] if mantener_preferida else sesion.id,
@@ -411,6 +457,8 @@ def registrar_sesion_disponible(sesion: SesionInstagram) -> None:
 
 def registrar_error_sesion(sesion: SesionInstagram, error: ErrorSesionInstagram) -> None:
     """Guardar el error; sólo login/CAPTCHA/archivo inválido requieren renovación."""
+    if error.tipo in {"pausada", "deshabilitada"}:
+        return
     estado = {"tipo": error.tipo, "huella": _huella(sesion), "ultimo_error": _ahora()}
     if error.http_status is not None:
         estado["http_status"] = error.http_status
@@ -422,14 +470,15 @@ def registrar_error_sesion(sesion: SesionInstagram, error: ErrorSesionInstagram)
     logger.warning("Error en sesión %s: %s", sesion.etiqueta, error.tipo)
 
 
-# Compatibilidad con utilidades anteriores: ya no crea ninguna suspensión.
 _suspender = registrar_error_sesion
 
 
 def _indisponibilidad(sesion: SesionInstagram) -> dict[str, str] | None:
+    if estado_pausa_sesion(sesion.id):
+        return {"sesion": sesion.etiqueta, "tipo": "pausada", "detalle": "sesión pausada por el usuario"}
     estado = _registro()["sesiones"].get(sesion.id, {})
     if estado.get("huella") != _huella(sesion):
-        return None  # Un JSON reemplazado permite reintentar automáticamente.
+        return None
     tipo = estado.get("tipo", "disponible")
     if estado.get("requiere_renovar"):
         detalle = "requiere renovar el archivo de sesión"
@@ -447,6 +496,8 @@ def ejecutar_con_sesiones(username: str, operacion: Callable[[], Any], *,
         registro_previo = _registro()
         vinculo = registro_previo["perfiles"].get(username)
         perfil_vinculado = username in registro_previo["perfiles"]
+        if perfil_vinculado and (not isinstance(vinculo, dict) or not isinstance(vinculo.get("sesiones_con_acceso", []), list)):
+            raise ConfiguracionSesionesError("El vínculo de este perfil es inválido.")
         preferida = vinculo.get("sesion_id") if isinstance(vinculo, dict) else None
         autorizadas = set()
         acceso_previo = vinculo.get("sesiones_con_acceso", []) if isinstance(vinculo, dict) else []
@@ -455,6 +506,9 @@ def ejecutar_con_sesiones(username: str, operacion: Callable[[], Any], *,
         if isinstance(acceso_previo, list):
             autorizadas.update(fila["id"] for fila in acceso_previo
                                if isinstance(fila, dict) and isinstance(fila.get("id"), str) and fila["id"])
+        solo_asociadas = _SOLO_ASOCIADAS.get()
+        if solo_asociadas and not autorizadas:
+            raise SinSesionAsociadaDisponible(username, [])
         orden = None
         if orden_sesion_ids is not None:
             if not isinstance(orden_sesion_ids, list) or any(
@@ -474,27 +528,37 @@ def ejecutar_con_sesiones(username: str, operacion: Callable[[], Any], *,
             raise SesionesAgotadas(username, [{"sesion": "comprobación manual", "tipo": "vinculo",
                 "detalle": "sólo se puede comprobar el perfil y la sesión elegidos"}])
         if actual is not None:
+            comprobar_sesion_habilitada(actual)
             if orden is not None and actual.id not in orden:
                 raise SesionesAgotadas(username, [{"sesion": actual.etiqueta, "tipo": "vinculo",
                     "detalle": "la sesión actual no pertenece al orden elegido"}])
             if perfil_vinculado and actual.id not in autorizadas and comprobacion_manual is None:
                 raise SesionesAgotadas(username, [{"sesion": actual.etiqueta, "tipo": "vinculo",
                     "detalle": "esta sesión no tiene acceso registrado a este perfil"}])
-            return operacion()  # Las llamadas anidadas conservan la cuenta autorizada.
-        sesiones = listar_sesiones()
+            return operacion()
+        todas = listar_sesiones(incluir_pausadas=True)
+        pausadas = {s.id for s in todas if estado_pausa_sesion(s.id)}
+        recuperar = not solo_asociadas and perfil_vinculado and (not autorizadas or bool((autorizadas | set(orden or [])) & pausadas))
+        sesiones = list(todas)
         if orden is not None:
             por_id = {sesion.id: sesion for sesion in sesiones}
             sesiones = [por_id[ident] for ident in orden if ident in por_id]
-            if not sesiones:
+            if not sesiones and not recuperar:
                 raise SesionesAgotadas(username, [{"sesion": "sesiones elegidas", "tipo": "vinculo",
                     "detalle": "ninguna sesión del orden elegido está habilitada"}])
         elif perfil_vinculado:
             sesiones = [s for s in sesiones if s.id in autorizadas]
-            if not sesiones:
-                raise SesionesAgotadas(username, [{"sesion": "sesiones autorizadas", "tipo": "vinculo",
+            if not sesiones and not recuperar:
+                error_agotadas = SinSesionAsociadaDisponible if solo_asociadas else SesionesAgotadas
+                raise error_agotadas(username, [{"sesion": "sesiones autorizadas", "tipo": "vinculo",
                     "detalle": "no hay sesiones habilitadas con acceso registrado a este perfil"}])
-        if orden is None:
-            sesiones.sort(key=lambda s: s.id != preferida)
+        if orden is not None and recuperar:
+            incluidas = {s.id for s in sesiones}
+            sesiones.extend(s for s in todas if s.id in autorizadas and s.id not in incluidas and s.id not in pausadas)
+        if orden is not None and any(s.reserva for s in sesiones):
+            incluidas = {s.id for s in sesiones}
+            sesiones.extend(s for s in todas if s.id in autorizadas and not s.reserva and s.id not in incluidas)
+        sesiones = ordenar_sesiones_por_prioridad(sesiones, preferida, conservar_orden=orden is not None)
         explorar_todas = verificar_todas and not perfil_vinculado
         fallos = []
         exitos: list[tuple[SesionInstagram, Any]] = []
@@ -511,19 +575,18 @@ def ejecutar_con_sesiones(username: str, operacion: Callable[[], Any], *,
                     resultado = operacion()
             except SinHistoriasDisponibles:
                 _exito(sesion, username, vincular, conservar_preferida=conservar_preferida)
-                raise  # Vacío y acceso confirmado: no hay motivo para rotar.
+                raise
             except (PerfilPrivado, PerfilNoEncontrado) as error:
                 tipo = "privado" if isinstance(error, PerfilPrivado) else "no_encontrado"
                 detalle = "perfil privado sin acceso" if tipo == "privado" else "perfil no encontrado"
                 fallos.append({"sesion": sesion.etiqueta, "tipo": tipo, "detalle": detalle})
             except ErrorSesionInstagram as error:
                 registrar_error_sesion(sesion, error)
-                detalle = str(error)  # Sólo errores construidos localmente, sin cuerpos/cookies.
+                detalle = str(error)
                 fallos.append({"sesion": sesion.etiqueta, "tipo": error.tipo, "detalle": detalle})
             except ErrorConsultaInstagram as error:
                 fallos.append({"sesion": sesion.etiqueta, "tipo": "consulta", "detalle": str(error)[:240]})
             except Exception as error:
-                # Fallos de disco/código se propagan; cambiar de cuenta no los arregla.
                 if error.__class__.__name__ != "TimeoutError":
                     raise
                 fallos.append({"sesion": sesion.etiqueta, "tipo": "timeout", "detalle": "tiempo de espera agotado"})
@@ -534,7 +597,7 @@ def ejecutar_con_sesiones(username: str, operacion: Callable[[], Any], *,
                 if not verificar_todas:
                     return resultado
                 if not explorar_todas:
-                    break  # Un vínculo existente se valida con la primera sesión autorizada que funciona.
+                    break
 
         if exitos:
             elegida, resultado = exitos[0]
@@ -551,6 +614,19 @@ def ejecutar_con_sesiones(username: str, operacion: Callable[[], Any], *,
             return {**resultado, "sesion_id": elegida.id, "sesion_username": elegida.username,
                     "sesiones_con_acceso": acceso, "sesiones_verificadas": verificadas,
                     "sesiones_con_error": fallos}
+        if recuperar:
+            intentadas = {s.id for s in sesiones}
+            candidatas = [s for s in todas if s.id not in intentadas and s.id not in pausadas]
+            recuperada = _recuperar_acceso_por_pausa(username, candidatas, operacion, fallos)
+            if recuperada is not None:
+                elegida, resultado, adicionales = recuperada
+                if verificar_todas:
+                    return {**resultado, "sesion_id": elegida.id, "sesion_username": elegida.username,
+                            "sesiones_con_acceso": obtener_vinculo(username)["sesiones_con_acceso"],
+                            "sesiones_verificadas": verificadas + adicionales, "sesiones_con_error": fallos}
+                return resultado
+        if solo_asociadas:
+            raise SinSesionAsociadaDisponible(username, fallos)
         if fallos and all(fallo["tipo"] == "privado" for fallo in fallos):
             raise PerfilPrivado(f"Ninguna de las {len(sesiones)} sesiones tiene acceso a @{username}.")
         if fallos and all(fallo["tipo"] == "no_encontrado" for fallo in fallos):
@@ -839,8 +915,6 @@ def actualizar_accesos_sesion(sesion_id: str, usernames: list[str],
             if demora_entre_perfiles and len(resultados) < len(objetivos):
                 time.sleep(demora_entre_perfiles)
         if not informe["interrumpida"]:
-            # Las respuestas incompletas o timeouts pueden reintentarse sin
-            # repetir los accesos y denegaciones ya confirmados.
             hay_errores = any(fila["tipo"] not in ("acceso", "privado", "no_encontrado")
                              for fila in resultados.values())
             informe.update(username_actual=None, etapa="parcial" if hay_errores else "completada")
@@ -904,8 +978,6 @@ def cambiar_sesion_preferida(username: str, sesion_id: str,
                     finally:
                         _VERIFICACION_MANUAL.reset(token)
                     _validar_acceso_confirmado(perfil, username, elegida)
-                # El verificador puede renovar sus cookies; validar el archivo
-                # final y una configuración que pudo cambiar durante la consulta.
                 if not any(sesion == elegida for sesion in listar_sesiones()):
                     raise ConfiguracionSesionesError("La sesión elegida cambió durante la comprobación.")
                 comprobar_archivo_sesion()
@@ -913,8 +985,6 @@ def cambiar_sesion_preferida(username: str, sesion_id: str,
             registrar_error_sesion(elegida, error)
             raise
 
-        # Conservar cada fila autorizada y su metadata; añadir únicamente las
-        # cuentas que ya estaban autorizadas o acaban de confirmar acceso.
         accesos_finales = list(accesos)
         anterior_id = anterior.get("sesion_id")
         if isinstance(anterior_id, str) and anterior_id and not any(
@@ -942,7 +1012,6 @@ def con_sesiones(*, verificar_todas: bool = False, vincular: bool = True):
     def decorar(funcion):
         @wraps(funcion)
         def ejecutar(username: str, *args, **kwargs):
-            # Normaliza antes de consultar: URLs y @ deben compartir vínculo.
             normalizado = str(username).strip()
             match = re.search(r"instagram\.com/(?:stories/)?([^/?#]+)", normalizado, re.I)
             if match:
@@ -963,8 +1032,13 @@ def registrar_sesion(identificador: str, username: str | None, archivo: Path) ->
         config = _leer_json(ruta) if ruta.exists() else {
             "version": 1, "sesiones": [{"id": "principal", "username": None, "archivo": None, "habilitada": True}]
         }
-        # Valida el contenido existente antes de modificarlo.
         listar_sesiones(incluir_deshabilitadas=True)
+        try:
+            aliases = validar_aliases(config)
+        except ValueError as error:
+            raise ConfiguracionSesionesError(str(error)) from error
+        if identificador.strip().lower() in aliases:
+            raise ConfiguracionSesionesError('Ese ID es un alias retirado; renová la sesión ' + aliases[identificador.strip().lower()] + '.')
         try:
             archivo_relativo = archivo.resolve().relative_to(BASE_DIR).as_posix()
         except ValueError:
@@ -974,7 +1048,7 @@ def registrar_sesion(identificador: str, username: str | None, archivo: Path) ->
         existentes = config["sesiones"]
         for indice, anterior in enumerate(existentes):
             if anterior["id"] == identificador:
-                existentes[indice] = fila
+                existentes[indice] = {**anterior, **fila}
                 break
         else:
             existentes.append(fila)
@@ -984,28 +1058,155 @@ def registrar_sesion(identificador: str, username: str | None, archivo: Path) ->
 def estado_sesiones_local() -> list[dict[str, Any]]:
     with LOCK:
         resultado = []
-        for sesion in listar_sesiones():
+        habilitadas = {s.id for s in listar_sesiones(incluir_pausadas=True)}
+        for sesion in listar_sesiones(incluir_deshabilitadas=True):
+            pausa = estado_pausa_sesion(sesion.id)
+            habilitada = sesion.id in habilitadas
             indisponible = _indisponibilidad(sesion)
             error = None
-            try:
-                with usar_sesion(sesion):
-                    comprobar_archivo_sesion()
-            except ErrorSesionInstagram as exc:
-                error = str(exc)
-            ultimo = _registro()["sesiones"].get(sesion.id, {})
-            ultimo_tipo = ultimo.get("tipo") if isinstance(ultimo, dict) else None
-            if ultimo_tipo == "disponible" or ultimo.get("huella") != _huella(sesion):
+            if pausa is None and habilitada:
+                try:
+                    with usar_sesion(sesion):
+                        comprobar_archivo_sesion()
+                except ErrorSesionInstagram as exc:
+                    error = str(exc)
+            ultimo = _registro()['sesiones'].get(sesion.id, {})
+            ultimo_tipo = ultimo.get('tipo') if isinstance(ultimo, dict) else None
+            if ultimo_tipo == 'disponible' or ultimo.get('huella') != _huella(sesion):
                 ultimo_tipo = None
-            detalle = error or (indisponible["detalle"] if indisponible else
-                               "Archivo de sesión válido; sin comprobación remota.")
-            errores = {"rate_limit": "Instagram rechazó la última consulta por límite de solicitudes (HTTP 429).",
-                       "http_400": "Instagram rechazó la última consulta (HTTP 400).",
-                       "rechazada": "Instagram rechazó la última consulta (HTTP 403)."}
-            if not error and not indisponible and ultimo_tipo in errores:
-                detalle += "\n" + errores[ultimo_tipo]
-            resultado.append({"id": sesion.id, "username": sesion.username,
-                              "etiqueta": sesion.etiqueta,
-                              "disponible": indisponible is None and error is None,
-                              "ultimo_error_tipo": ultimo_tipo,
-                              "detalle": detalle})
+            if pausa:
+                detalle = 'Pausada hasta reanudarla manualmente.' if pausa['reanudar_en'] is None else 'Pausada con reanudación automática.'
+            elif not habilitada:
+                detalle = 'Deshabilitada en la configuración.'
+            else:
+                detalle = error or (indisponible['detalle'] if indisponible else 'Archivo de sesión válido; sin comprobación remota.')
+                errores = {'rate_limit': 'Instagram rechazó la última consulta por límite de solicitudes (HTTP 429).',
+                           'http_400': 'Instagram rechazó la última consulta (HTTP 400).',
+                           'rechazada': 'Instagram rechazó la última consulta (HTTP 403).'}
+                if not error and not indisponible and ultimo_tipo in errores:
+                    detalle += '\n' + errores[ultimo_tipo]
+            resultado.append({'id': sesion.id, 'username': sesion.username, 'etiqueta': sesion.etiqueta,
+                              'habilitada': habilitada, 'pausada': pausa is not None,
+                              'reanudar_en': pausa['reanudar_en'] if pausa else None,
+                              'disponible': habilitada and pausa is None and indisponible is None and error is None,
+                              'ultimo_error_tipo': ultimo_tipo, 'detalle': detalle})
         return resultado
+
+
+def _politica_pausas(registro=None) -> dict:
+    registro = _registro() if registro is None else registro
+    try:
+        return politica_pausas.validar_pausas(registro.get('pausas_sesiones', {}))
+    except ValueError as error:
+        raise ConfiguracionSesionesError(str(error)) from error
+
+
+def estado_pausa_sesion(identificador: str) -> dict | None:
+    with LOCK:
+        return politica_pausas.pausa_vigente(_politica_pausas(), identificador)
+
+
+def comprobar_sesion_habilitada(sesion: SesionInstagram) -> None:
+    with LOCK:
+        if sesion not in listar_sesiones(incluir_pausadas=True):
+            raise ErrorSesionInstagram('deshabilitada', 'La sesión está deshabilitada o cambió su configuración.')
+        pausa = estado_pausa_sesion(sesion.id)
+        if pausa:
+            raise ErrorSesionInstagram('pausada', 'La sesión está pausada; no se realizarán consultas con ella.')
+
+
+def pausar_sesion(identificador: str, hasta: datetime | None = None, *,
+                 sesion_esperada: SesionInstagram | None = None) -> dict:
+    with LOCK:
+        elegida = next((s for s in listar_sesiones(incluir_pausadas=True) if s.id == identificador), None)
+        if elegida is None or sesion_esperada is not None and elegida != sesion_esperada:
+            raise ConfiguracionSesionesError('La sesión ya no está habilitada o cambió desde que abriste el menú.')
+        pausa = politica_pausas.crear_pausa(hasta)
+        registro = _registro()
+        _politica_pausas(registro)
+        registro.setdefault('pausas_sesiones', {})[identificador] = pausa
+        escribir_json_atomico(ruta_registro(), registro)
+        return pausa
+
+
+def reanudar_sesion(identificador: str, *, sesion_esperada: SesionInstagram | None = None) -> None:
+    with LOCK:
+        elegida = next((s for s in listar_sesiones(incluir_deshabilitadas=True) if s.id == identificador), None)
+        if elegida is None or sesion_esperada is not None and elegida != sesion_esperada:
+            raise ConfiguracionSesionesError('La sesión ya no existe o cambió desde que abriste el menú.')
+        registro = _registro()
+        _politica_pausas(registro)
+        if registro.get('pausas_sesiones', {}).pop(identificador, None) is not None:
+            escribir_json_atomico(ruta_registro(), registro)
+
+
+def reanudar_pausas_vencidas() -> list[str]:
+    with LOCK:
+        registro = _registro()
+        vencidas = politica_pausas.vencidas(_politica_pausas(registro))
+        if vencidas:
+            for identificador in vencidas:
+                registro['pausas_sesiones'].pop(identificador)
+            escribir_json_atomico(ruta_registro(), registro)
+        return vencidas
+
+
+def listar_pausas_sesiones() -> dict:
+    with LOCK:
+        conocidas = {s.id for s in listar_sesiones(incluir_deshabilitadas=True)}
+        return {identificador: dict(fila) for identificador, fila in _politica_pausas().items()
+                if identificador in conocidas and estado_pausa_sesion(identificador) is not None}
+
+
+def _recuperar_acceso_por_pausa(username: str, candidatas: list[SesionInstagram],
+                               operacion: Callable[[], Any], fallos: list[dict[str, str]]):
+    from history import comprobar_perfil_accesible
+    verificadas = 0
+    for sesion in ordenar_sesiones_por_prioridad(candidatas):
+        indisponible = _indisponibilidad(sesion)
+        if indisponible:
+            fallos.append(indisponible)
+            continue
+        verificadas += 1
+        try:
+            with usar_sesion(sesion):
+                comprobar_archivo_sesion()
+                token = _VERIFICACION_MANUAL.set((username, sesion.id))
+                try:
+                    perfil = comprobar_perfil_accesible(username, sin_historias=True)
+                finally:
+                    _VERIFICACION_MANUAL.reset(token)
+                _validar_acceso_confirmado(perfil, username, sesion)
+                comprobar_sesion_habilitada(sesion)
+                registro = _registro()
+                anterior = registro['perfiles'].get(username, {})
+                accesos = list(anterior.get('sesiones_con_acceso', []))
+                for ident, nombre in [(anterior.get('sesion_id'), anterior.get('cuenta')), (sesion.id, sesion.username)]:
+                    if ident and not any(isinstance(fila, dict) and fila.get('id') == ident for fila in accesos):
+                        accesos.append({'id': ident, 'username': nombre})
+                registro['perfiles'][username] = {
+                    **anterior, 'sesion_id': sesion.id, 'cuenta': sesion.username,
+                    'sesiones_con_acceso': accesos, 'reasignada_por_pausa_en': _ahora(),
+                }
+                escribir_json_atomico(ruta_registro(), registro)
+                resultado = operacion()
+        except SinHistoriasDisponibles:
+            _exito(sesion, username, True)
+            raise
+        except (PerfilPrivado, PerfilNoEncontrado) as error:
+            tipo = 'privado' if isinstance(error, PerfilPrivado) else 'no_encontrado'
+            fallos.append({'sesion': sesion.etiqueta, 'tipo': tipo,
+                           'detalle': 'perfil privado sin acceso' if tipo == 'privado' else 'perfil no encontrado'})
+        except ErrorSesionInstagram as error:
+            registrar_error_sesion(sesion, error)
+            fallos.append({'sesion': sesion.etiqueta, 'tipo': error.tipo, 'detalle': str(error)})
+        except ErrorConsultaInstagram as error:
+            fallos.append({'sesion': sesion.etiqueta, 'tipo': 'consulta', 'detalle': str(error)[:240]})
+        except Exception as error:
+            if error.__class__.__name__ != 'TimeoutError':
+                raise
+            fallos.append({'sesion': sesion.etiqueta, 'tipo': 'timeout', 'detalle': 'tiempo de espera agotado'})
+        else:
+            _exito(sesion, username, True)
+            return sesion, resultado, verificadas
+    return None

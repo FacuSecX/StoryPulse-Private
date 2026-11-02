@@ -1,599 +1,387 @@
 #!/usr/bin/env bash
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
+set +x
 set -Eeuo pipefail
+umask 077
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
+REPOSITORY='https://github.com/FacuSecX/StoryPulse-Private.git'
+VERACRYPT_VERSION='1.26.30'
+MEGACMD_VERSION='2.7.0-1.1'
+SYSTEM_TIMEZONE='America/Argentina/Buenos_Aires'
+CONFIG_INPUT=''
+SKIP_START=0
+SOURCE_DIR=''
+STAGE=''
+BACKUPS_RESULT='No solicitados'
+FILEBROWSER_RESULT='No solicitado'
+LOG_FILE=''
 
-# ============================================================
-# StoryPulse Private v2.0 - Instalador Linux
-# ============================================================
-# Diseñado para ejecutarse desde la raíz del repositorio.
-#
-# Instala:
-#   - Python + pip + venv
-#   - dependencias de requirements.txt
-#   - Chromium para Playwright
-#   - usuario de servicio "storypulse"
-#   - proyecto en el home del usuario de servicio
-#   - almacenamiento persistente en /historys
-#   - servicio systemd de StoryPulse
-#   - File Browser opcional apuntando a /historys
-#
-# IMPORTANTE:
-#   - Debe ejecutarse como root.
-#   - Playwright soporta oficialmente Debian/Ubuntu en Linux.
-#     En otras distribuciones se intenta una instalación compatible
-#     y luego se verifica que Chromium pueda iniciar correctamente.
-# ============================================================
+usage() {
+    cat <<'HELP'
+Uso: sudo bash instalar-debian13.sh [--config /ruta/privada.json] [--skip-start]
 
-APP_USER="storypulse"
-APP_NAME="StoryPulse-Private"
-STORAGE_DIR="/historys"
-SERVICE_NAME="storypulse"
-SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-FB_SERVICE_NAME="storypulse-filemanager"
-FB_DB_DIR=""
-FB_DB=""
-FB_BIND="127.0.0.1"
-FB_PORT="8080"
-FB_PASSWORD_CREATED=""
-
-green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
-yellow() { printf '\033[1;33m%s\033[0m\n' "$*"; }
-red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
-blue()   { printf '\033[1;34m%s\033[0m\n' "$*"; }
-
-die() {
-    red "ERROR: $*"
-    exit 1
+El modo normal pregunta servicio, usuario Linux, token/Chat ID de Telegram y MEGA
+opcional y FileBrowser Quantum opcional. No se necesita una sesión Instagram para
+arrancar; se agrega después.
+La configuración --config debe ser de root, modo 600. Campos: service, user,
+telegram_token, telegram_chat_id; opcionales timezone, panel_url, backups (bool),
+mega_email, mega_password, filebrowser (bool). Nunca pases secretos como argumentos.
+--skip-start instala y valida sin iniciar el bot ni contactar Telegram o MEGA.
+--source /ruta permite instalar una copia local para pruebas antes de publicarla.
+Sin --source, se clona exclusivamente el repositorio oficial.
+La zona horaria del servidor y del bot se configura para Argentina.
+HELP
 }
-
-trap 'red "La instalación se detuvo en la línea $LINENO."; exit 1' ERR
-
-echo
-echo "============================================================"
-echo "             StoryPulse Private - Instalador"
-echo "============================================================"
-echo
-
-# ------------------------------------------------------------
-# 1. ROOT
-# ------------------------------------------------------------
-if [[ "${EUID}" -ne 0 ]]; then
-    die "Necesitás ejecutar este instalador como usuario root.
-Ejemplo:
-    sudo bash server_install.sh"
-fi
-
-green "✓ Permisos root confirmados"
-
-# ------------------------------------------------------------
-# 2. VERIFICACIONES BÁSICAS
-# ------------------------------------------------------------
-if [[ ! -f "$SOURCE_DIR/bot.py" ]]; then
-    die "No encuentro bot.py junto al instalador."
-fi
-
-for required in history.py publicaciones.py database.py highlights.py instagram_sessions.py crear_session.py crearsession.py requirements.txt .env.example; do
-    [[ -f "$SOURCE_DIR/$required" ]] || die "Falta $required en $SOURCE_DIR"
-done
-
-if ! command -v systemctl >/dev/null 2>&1; then
-    die "Este instalador necesita una distribución con systemd/systemctl."
-fi
-
-# ------------------------------------------------------------
-# 3. DETECTAR DISTRIBUCIÓN / GESTOR DE PAQUETES
-# ------------------------------------------------------------
-OS_ID="unknown"
-OS_LIKE=""
-
-if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_LIKE="${ID_LIKE:-}"
-fi
-
-PKG_MANAGER=""
-
-if command -v apt-get >/dev/null 2>&1; then
-    PKG_MANAGER="apt"
-elif command -v dnf >/dev/null 2>&1; then
-    PKG_MANAGER="dnf"
-elif command -v yum >/dev/null 2>&1; then
-    PKG_MANAGER="yum"
-elif command -v zypper >/dev/null 2>&1; then
-    PKG_MANAGER="zypper"
-elif command -v pacman >/dev/null 2>&1; then
-    PKG_MANAGER="pacman"
-else
-    die "No se detectó un gestor compatible (apt, dnf, yum, zypper o pacman)."
-fi
-
-blue "Distribución detectada: ${OS_ID}"
-blue "Gestor de paquetes: ${PKG_MANAGER}"
-
-install_base_packages() {
-    case "$PKG_MANAGER" in
-        apt)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y \
-                python3 python3-pip python3-venv \
-                curl ca-certificates tar gzip
-            ;;
-        dnf)
-            dnf install -y \
-                python3 python3-pip \
-                curl ca-certificates tar gzip
-            ;;
-        yum)
-            yum install -y \
-                python3 python3-pip \
-                curl ca-certificates tar gzip
-            ;;
-        zypper)
-            zypper --non-interactive refresh
-            zypper --non-interactive install \
-                python3 python3-pip \
-                curl ca-certificates tar gzip
-            ;;
-        pacman)
-            pacman -Sy --noconfirm --needed \
-                python python-pip \
-                curl ca-certificates tar gzip
-            ;;
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+safe_path() {
+    local path=$1 component current=''
+    local -a components
+    [[ "$path" == /* ]] || return 1
+    IFS='/' read -r -a components <<< "$path"
+    for component in "${components[@]}"; do
+        [[ -n "$component" ]] || continue
+        [[ "$component" != . && "$component" != .. ]] || return 1
+        current+="/$component"
+        [[ ! -L "$current" ]] || return 1
+    done
+}
+root_directory() {
+    local path=$1 mode
+    safe_path "$path" || return 1
+    if [[ -e "$path" ]]; then
+        [[ -d "$path" && $(stat -c %u "$path") == 0 ]] || return 1
+        mode=$(stat -c %a "$path")
+        (( (8#$mode & 8#022) == 0 )) || return 1
+    fi
+}
+run_step() {
+    local title=$1
+    shift
+    printf '%s… ' "$title"
+    if "$@" >>"$LOG_FILE" 2>&1; then
+        printf 'completado\n'
+    else
+        printf 'falló\n' >&2
+        printf 'Registro privado: %s\n' "$LOG_FILE" >&2
+        return 1
+    fi
+}
+cleanup() { [[ -z "$STAGE" || ! -d "$STAGE" ]] || rm -rf -- "$STAGE"; }
+trap cleanup EXIT
+trap 'printf "La instalación se detuvo. Los datos existentes se conservan. Registro privado: %s\n" "${LOG_FILE:-no creado}" >&2' ERR
+while (($#)); do
+    case "$1" in
+        --config) [[ $# -ge 2 ]] || die 'Falta la ruta de configuración'; CONFIG_INPUT=$2; shift 2 ;;
+        --skip-start) SKIP_START=1; shift ;;
+        --source) [[ $# -ge 2 ]] || die 'Falta el proyecto local'; SOURCE_DIR=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die 'Opción desconocida. Consultá --help.' ;;
     esac
-}
-
-echo
-blue "[1/9] Instalando dependencias base del sistema..."
-install_base_packages
-
-command -v python3 >/dev/null 2>&1 || die "Python 3 no quedó instalado."
-command -v curl >/dev/null 2>&1 || die "curl no quedó instalado."
-
-PYTHON_BIN="$(command -v python3)"
-
-"$PYTHON_BIN" - <<'PY'
-import sys
-if sys.version_info < (3, 11):
-    raise SystemExit(
-        f"StoryPulse requiere Python 3.11 o superior. "
-        f"Detectado: {sys.version.split()[0]}"
-    )
-print(f"Python detectado: {sys.version.split()[0]}")
-PY
-
-# ------------------------------------------------------------
-# 4. USUARIO DE SERVICIO Y HOME UNIVERSAL
-# ------------------------------------------------------------
-echo
-blue "[2/9] Preparando usuario y directorio del proyecto..."
-
-if ! id "$APP_USER" >/dev/null 2>&1; then
-    command -v useradd >/dev/null 2>&1 || die "No existe el comando useradd."
-
-    NOLOGIN_SHELL="$(command -v nologin 2>/dev/null || true)"
-    [[ -n "$NOLOGIN_SHELL" ]] || NOLOGIN_SHELL="/bin/false"
-
-    useradd \
-        --create-home \
-        --home-dir "/home/$APP_USER" \
-        --shell "$NOLOGIN_SHELL" \
-        "$APP_USER"
+done
+[[ $EUID -eq 0 ]] || die 'Ejecutá el instalador con sudo o como root.'
+[[ -f /etc/os-release ]] || die 'No se pudo identificar el sistema.'
+. /etc/os-release
+[[ "$ID" == debian && "$VERSION_ID" == 13 ]] || die 'Este instalador requiere Debian 13; no cambia la distribución.'
+[[ -d /run/systemd/system ]] || die 'Se requiere un servidor con systemd activo.'
+exec 9>/run/lock/storypulse-installer.lock
+flock -n 9 || die 'Ya hay otra instalación en curso.'
+ARCH=$(dpkg --print-architecture)
+[[ "$ARCH" == amd64 ]] || die 'Esta versión comprobada del instalador requiere Debian 13 amd64.'
+STAGE=$(mktemp -d /var/tmp/storypulse-install.XXXXXXXX)
+chmod 700 "$STAGE"
+safe_path /var/log/storypulse-installer || die 'Directorio de registro inseguro.'
+if [[ -e /var/log/storypulse-installer ]]; then
+    [[ -d /var/log/storypulse-installer && $(stat -c %u /var/log/storypulse-installer) == 0 ]] || die 'Directorio de registro ajeno.'
 fi
-
-APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
-[[ -n "$APP_HOME" ]] || APP_HOME="/home/$APP_USER"
-
-APP_GROUP="$(id -gn "$APP_USER")"
-APP_DIR="$APP_HOME/$APP_NAME"
-VENV_DIR="$APP_DIR/venv"
-PW_DIR="$APP_HOME/.cache/ms-playwright"
-
-mkdir -p "$APP_DIR" "$PW_DIR"
-
-# Copiamos sólo archivos públicos/esperados del repositorio.
-PUBLIC_FILES=(
-    "bot.py"
-    "history.py"
-    "publicaciones.py"
-    "database.py"
-    "highlights.py"
-    "instagram_sessions.py"
-    "crear_session.py"
-    "crearsession.py"
-    "requirements.txt"
-    ".env.example"
-)
-
-OPTIONAL_FILES=(
-    "README.md"
-    ".gitignore"
-    "probar_sesion_vps.py"
-    "probar_motor.py"
-    "renovar_session_vps.py"
-    "RENOVAR_SESSION.bat"
-    "renovar_session_vps.config.ejemplo.json"
-    "sesiones_instagram.example.json"
-)
-
-for file in "${PUBLIC_FILES[@]}"; do
-    cp -f "$SOURCE_DIR/$file" "$APP_DIR/$file"
-done
-
-for file in "${OPTIONAL_FILES[@]}"; do
-    if [[ -f "$SOURCE_DIR/$file" ]]; then
-        cp -f "$SOURCE_DIR/$file" "$APP_DIR/$file"
-    fi
-done
-
-chown -R "$APP_USER:$APP_GROUP" "$APP_HOME"
-chmod 750 "$APP_HOME" "$APP_DIR"
-
-# Preservar sesiones existentes y limitar el acceso a sus archivos privados.
-for private_file in instagram_state.json sesiones_instagram.json estado_sesiones_instagram.json; do
-    if [[ -f "$APP_DIR/$private_file" ]]; then
-        chmod 600 "$APP_DIR/$private_file"
-    fi
-done
-if [[ -d "$APP_DIR/sesiones_instagram" ]]; then
-    chmod 700 "$APP_DIR/sesiones_instagram"
-    find "$APP_DIR/sesiones_instagram" -maxdepth 1 -type f -name '*.json' -exec chmod 600 {} +
+install -d -m 700 -o root -g root /var/log/storypulse-installer
+LOG_FILE="/var/log/storypulse-installer/instalacion-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+install -m 600 /dev/null "$LOG_FILE"
+printf 'Instalador StoryPulse Private · Debian 13\n'
+run_step 'Actualizando lista de paquetes' apt-get update
+run_step 'Instalando dependencias del sistema' apt-get install -y --no-remove --no-install-recommends ca-certificates curl git python3 python3-venv \
+    python3-pip sudo acl tzdata util-linux gnupg openssl iproute2
+run_step 'Configurando hora de Argentina' timedatectl set-timezone "$SYSTEM_TIMEZONE"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+SUPPORT_DIR=$SCRIPT_DIR
+[[ -f "$SUPPORT_DIR/configure.py" ]] || SUPPORT_DIR="$SCRIPT_DIR/installer"
+if [[ ! -f "$SUPPORT_DIR/configure.py" ]]; then
+    SUPPORT_DIR="$STAGE/support"
+    install -d -m 700 "$SUPPORT_DIR"
+    for helper in configure.py; do
+        if ! run_step 'Preparando asistente de instalación' curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 90 \
+            --output "$SUPPORT_DIR/$helper" "https://raw.githubusercontent.com/FacuSecX/StoryPulse-Private/main/installer/$helper"; then
+            die 'Publicá primero esta versión completa en el repositorio oficial, incluido installer/.'
+        fi
+    done
 fi
-
-green "✓ Proyecto instalado en: $APP_DIR"
-
-# ------------------------------------------------------------
-# 5. /historys
-# ------------------------------------------------------------
-echo
-blue "[3/9] Creando almacenamiento raíz..."
-
-mkdir -p "$STORAGE_DIR"
-chown "$APP_USER:$APP_GROUP" "$STORAGE_DIR"
-chmod 750 "$STORAGE_DIR"
-
-green "✓ Almacenamiento preparado en: $STORAGE_DIR"
-
-# ------------------------------------------------------------
-# 6. VENV + REQUIREMENTS
-# ------------------------------------------------------------
-echo
-blue "[4/9] Creando entorno virtual..."
-
-rm -rf "$VENV_DIR"
-"$PYTHON_BIN" -m venv "$VENV_DIR"
-
-"$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
-
-chown -R "$APP_USER:$APP_GROUP" "$VENV_DIR"
-
-green "✓ Entorno virtual y requirements instalados"
-
-# ------------------------------------------------------------
-# 7. PLAYWRIGHT + CHROMIUM
-# ------------------------------------------------------------
-echo
-blue "[5/9] Instalando Chromium para Playwright..."
-
-PLAYWRIGHT_OFFICIALLY_SUPPORTED="no"
-case "$OS_ID" in
-    debian|ubuntu)
-        PLAYWRIGHT_OFFICIALLY_SUPPORTED="yes"
-        ;;
-esac
-
-if [[ "$PLAYWRIGHT_OFFICIALLY_SUPPORTED" == "yes" ]]; then
-    PLAYWRIGHT_BROWSERS_PATH="$PW_DIR" \
-        "$VENV_DIR/bin/python" -m playwright install --with-deps chromium
+CONFIG="$STAGE/config.json"
+if [[ -n "$CONFIG_INPUT" ]]; then
+    python3 -B "$SUPPORT_DIR/configure.py" prepare "$CONFIG" --input "$CONFIG_INPUT"
 else
-    yellow "⚠ Playwright no declara soporte oficial para '${OS_ID}'."
-    yellow "  Se instalará Chromium y luego se hará una prueba real de arranque."
-
-    PLAYWRIGHT_BROWSERS_PATH="$PW_DIR" \
-        "$VENV_DIR/bin/python" -m playwright install chromium
+    python3 -B "$SUPPORT_DIR/configure.py" prepare "$CONFIG"
 fi
-
-chown -R "$APP_USER:$APP_GROUP" "$PW_DIR"
-
-echo
-blue "Verificando que Chromium pueda iniciar..."
-
-if ! PLAYWRIGHT_BROWSERS_PATH="$PW_DIR" \
-    "$VENV_DIR/bin/python" - <<'PY'
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    browser.close()
-print("Chromium OK")
-PY
-then
-    die "Chromium/Playwright no pudo iniciar en esta distribución.
-La instalación base quedó creada, pero esta distribución necesita
-dependencias adicionales o no es compatible con el Chromium de Playwright."
+mapfile -t META < <(python3 -B "$SUPPORT_DIR/configure.py" metadata "$CONFIG")
+[[ ${#META[@]} -eq 6 ]] || die 'No se pudo validar la configuración.'
+SERVICE_NAME=${META[0]}
+RUN_USER=${META[1]}
+RUN_GROUP=$(id -gn "$RUN_USER")
+BOT_GID=${META[2]}
+RUN_HOME=${META[3]}
+WANT_BACKUPS=${META[4]}
+WANT_FILEBROWSER=${META[5]}
+PROJECT_DIR="$RUN_HOME/StoryPulse-Private"
+VENV_DIR="$PROJECT_DIR/.venv"
+PYTHON_BIN="$VENV_DIR/bin/python"
+BROWSERS_DIR="$PROJECT_DIR/.pw-browsers"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+for target in "$RUN_HOME" "$PROJECT_DIR" "$SERVICE_FILE" /historys; do
+    safe_path "$target" || die 'Una ruta de la instalación contiene un enlace inseguro.'
+done
+[[ $(stat -c %u "$RUN_HOME") == "$(id -u "$RUN_USER")" ]] || die 'El directorio personal no pertenece al usuario.'
+if [[ -e "$SERVICE_FILE" ]] && ! grep -Fq '# Managed by StoryPulse installer' "$SERVICE_FILE"; then
+    die 'Ese nombre pertenece a otro servicio; elegí uno diferente.'
 fi
-
-green "✓ Playwright + Chromium funcionando"
-
-# ------------------------------------------------------------
-# 8. FILE MANAGER OPCIONAL
-# ------------------------------------------------------------
-echo
-echo "============================================================"
-echo "              PANEL WEB / FILE MANAGER"
-echo "============================================================"
-echo
-read -r -p "¿Deseás instalar un FILE MANAGER web para /historys? [s/N]: " INSTALL_FB
-INSTALL_FB="${INSTALL_FB,,}"
-
-PANEL_URL=""
-
-if [[ "$INSTALL_FB" == "s" || "$INSTALL_FB" == "si" || "$INSTALL_FB" == "sí" || "$INSTALL_FB" == "y" || "$INSTALL_FB" == "yes" ]]; then
-    echo
-    blue "[6/9] Instalando File Browser..."
-
-    # Instalador oficial de File Browser.
-    curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
-
-    FILEBROWSER_BIN="$(command -v filebrowser || true)"
-    [[ -n "$FILEBROWSER_BIN" ]] || die "File Browser no quedó instalado."
-
-    read -r -p "Puerto del File Manager [8080]: " FB_PORT_INPUT
-    FB_PORT="${FB_PORT_INPUT:-8080}"
-
-    if ! [[ "$FB_PORT" =~ ^[0-9]+$ ]] || (( FB_PORT < 1 || FB_PORT > 65535 )); then
-        die "Puerto inválido: $FB_PORT"
+if [[ -L "$PROJECT_DIR" ]]; then die 'El directorio del proyecto no puede ser un enlace.'; fi
+if [[ -n "$SOURCE_DIR" ]]; then
+    SOURCE_DIR=$(realpath -e -- "$SOURCE_DIR")
+    [[ -f "$SOURCE_DIR/bot.py" && -f "$SOURCE_DIR/requirements.txt" ]] || die 'La copia local no contiene el proyecto.'
+    if [[ "$SOURCE_DIR" != "$PROJECT_DIR" ]]; then
+        [[ ! -e "$PROJECT_DIR" ]] || die 'Para las pruebas locales el destino debe ser nuevo.'
+        install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$PROJECT_DIR"
+        cp -a -- "$SOURCE_DIR/." "$PROJECT_DIR/"
+        chown -R "$RUN_USER:$RUN_GROUP" "$PROJECT_DIR"
     fi
+elif [[ ! -e "$PROJECT_DIR" ]]; then
+    run_step 'Descargando proyecto oficial' runuser -u "$RUN_USER" -- git clone --depth 1 "$REPOSITORY" "$PROJECT_DIR"
+else
+    [[ -d "$PROJECT_DIR/.git" ]] || die 'El destino existe y no es un clon; no se sobrescribió.'
+    ORIGIN=$(runuser -u "$RUN_USER" -- git -C "$PROJECT_DIR" remote get-url origin)
+    [[ "$ORIGIN" == "$REPOSITORY" || "$ORIGIN" == "${REPOSITORY%.git}" ]] || die 'El destino pertenece a otro repositorio.'
+    printf 'Se conserva el clon existente y todos sus datos. No se ejecuta reset/pull automático.\n'
+fi
+[[ -f "$PROJECT_DIR/bot.py" && -f "$PROJECT_DIR/requirements.txt" && -f "$PROJECT_DIR/navigation_ui.py" ]] \
+    || die 'El repositorio todavía no contiene esta versión. Publicá primero la copia limpia.'
+for target in "$VENV_DIR" "$VENV_DIR/bin" "$BROWSERS_DIR" "$PROJECT_DIR/.env" \
+              "$PROJECT_DIR/sesiones_instagram" "$PROJECT_DIR/perfiles_instagram"; do
+    safe_path "$target" || die 'Una carpeta de ejecución contiene un enlace inseguro.'
+done
+if [[ -e "$PYTHON_BIN" || -L "$PYTHON_BIN" ]]; then
+    [[ $(readlink -e -- "$PYTHON_BIN") == "$(readlink -e /usr/bin/python3)" ]] \
+        || die 'El entorno Python existente usa un intérprete inesperado; se conservó.'
+fi
+chmod 700 "$PROJECT_DIR"
+install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$PROJECT_DIR/sesiones_instagram" "$PROJECT_DIR/perfiles_instagram"
+if [[ -L /historys ]]; then die '/historys no puede ser un enlace.'; fi
+if [[ ! -d /historys ]]; then install -d -m 2770 -o "$RUN_USER" -g "$RUN_GROUP" /historys; fi
+setfacl -m "u:$RUN_USER:rwx" /historys
+setfacl -d -m "u:$RUN_USER:rwx" /historys
+if [[ ! -x "$PYTHON_BIN" ]]; then run_step 'Creando entorno Python' runuser -u "$RUN_USER" -- python3 -m venv "$VENV_DIR"; fi
+run_step 'Instalando módulos Python' runuser -u "$RUN_USER" -- "$PYTHON_BIN" -m pip install --disable-pip-version-check --requirement "$PROJECT_DIR/requirements.txt"
+run_step 'Preparando dependencias del navegador' "$PYTHON_BIN" -m playwright install-deps chromium
+install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" "$BROWSERS_DIR"
+run_step 'Instalando navegador Chromium' runuser -u "$RUN_USER" -- env PLAYWRIGHT_BROWSERS_PATH="$BROWSERS_DIR" "$PYTHON_BIN" -m playwright install chromium
+run_step 'Guardando configuración privada del bot' python3 -B "$SUPPORT_DIR/configure.py" env "$CONFIG" --project "$PROJECT_DIR"
+run_step 'Verificando entorno Python' runuser -u "$RUN_USER" -- "$PYTHON_BIN" -B -c \
+    'import telegram, dotenv, playwright, PIL; from zoneinfo import ZoneInfo; ZoneInfo("America/Argentina/Buenos_Aires")'
 
-    echo
-    echo "Por seguridad puede quedar escuchando sólo en localhost"
-    echo "para usarlo detrás de Nginx/Cloudflare/reverse proxy."
-    echo
-    read -r -p "¿Querés exponerlo directamente en la red? [s/N]: " FB_PUBLIC
-    FB_PUBLIC="${FB_PUBLIC,,}"
-
-    if [[ "$FB_PUBLIC" == "s" || "$FB_PUBLIC" == "si" || "$FB_PUBLIC" == "sí" || "$FB_PUBLIC" == "y" || "$FB_PUBLIC" == "yes" ]]; then
-        FB_BIND="0.0.0.0"
-        yellow "⚠ El File Manager quedará escuchando en 0.0.0.0:$FB_PORT"
-        yellow "  El instalador NO abre el firewall ni configura HTTPS."
-    else
-        FB_BIND="127.0.0.1"
-        green "✓ File Manager limitado a localhost:$FB_PORT"
+install_backups() (
+    set -Eeuo pipefail
+    for target in /usr/local/lib /usr/local/lib/storypulse-backups /usr/local/lib/storypulse-backups/storypulse_backups \
+                  /etc/storypulse-backups /var/lib /var/spool; do
+        root_directory "$target"
+    done
+    for target in /usr/local/lib/storypulse-backups/run.py /etc/storypulse-backups/config.json \
+                  /etc/storypulse-backups/credentials.json /var/lib/storypulse-backups \
+                  /var/lib/storypulse-backups/work /var/lib/storypulse-backups/mega /var/spool/storypulse-backups \
+                  /etc/systemd/system/storypulse-backups.service; do
+        safe_path "$target"
+    done
+    for target in /usr/local/lib/storypulse-backups/run.py /usr/local/lib/storypulse-backups/storypulse_backups/*.py; do
+        [[ -e "$target" || -L "$target" ]] || continue
+        [[ -f "$target" && ! -L "$target" && $(stat -c %u "$target") == 0 && $(stat -c %h "$target") == 1 ]]
+        mode=$(stat -c %a "$target")
+        (( (8#$mode & 8#022) == 0 ))
+    done
+    for target in /var/lib/storypulse-backups /var/lib/storypulse-backups/work /var/lib/storypulse-backups/mega; do
+        [[ -e "$target" ]] || continue
+        [[ -d "$target" && $(stat -c %u "$target") == 0 ]]
+        mode=$(stat -c %a "$target")
+        (( (8#$mode & 8#022) == 0 ))
+    done
+    if [[ -e /var/spool/storypulse-backups ]]; then
+        [[ -d /var/spool/storypulse-backups && $(stat -c %u /var/spool/storypulse-backups) == "$(id -u "$RUN_USER")" \
+           && $(stat -c %a /var/spool/storypulse-backups) == 700 ]]
     fi
-
-    FB_DB_DIR="$APP_HOME/.filebrowser"
-    FB_DB="$FB_DB_DIR/filebrowser.db"
-    mkdir -p "$FB_DB_DIR"
-    chown "$APP_USER:$APP_GROUP" "$FB_DB_DIR"
-
-    if [[ ! -f "$FB_DB" ]]; then
-        "$FILEBROWSER_BIN" \
-            -d "$FB_DB" \
-            config init \
-            --root "$STORAGE_DIR" \
-            --address "$FB_BIND" \
-            --port "$FB_PORT" \
-            --branding.name "StoryPulse Files"
-
-        FB_PASSWORD_CREATED="$("$PYTHON_BIN" - <<'PY'
-import secrets
-print(secrets.token_urlsafe(18))
+    if [[ -e /usr/local/lib/storypulse-backups && ! -f /usr/local/lib/storypulse-backups/.storypulse-managed ]]; then
+        printf 'Se conserva un directorio de backups previo ajeno a este instalador.\n' >&2
+        exit 1
+    fi
+    if [[ -e /etc/systemd/system/storypulse-backups.service ]]; then
+        if ! grep -Fq '# Managed by StoryPulse installer' /etc/systemd/system/storypulse-backups.service; then
+            printf 'Se conserva un servicio de backups previo ajeno a este instalador.\n' >&2
+            exit 1
+        fi
+        if systemctl is-active --quiet storypulse-backups.service; then
+            python3 -B "$SUPPORT_DIR/configure.py" backups "$CONFIG"
+            printf 'El servicio de backups ya está activo: no se sustituye código, clave ni estado.\n'
+            exit 0
+        fi
+    fi
+    case "$ARCH" in
+        amd64) VC_SHA=4afcaefaada73de258a9a34e03898be957221f0178290a84f0be57a8ede51c29
+               MEGA_SHA=d8c3c77d0417cba498fa6d4b3804fb657721afed072d6472c10e6b0b1b02dab9 ;;
+        arm64) VC_SHA=f4c75c7a213e49361cb3d93446862bff97aef1b25f854386d61555273d99a045
+               MEGA_SHA=6d032193817581984a698f641a2f35703a677d5697923df9fda43f7a317d528b ;;
+    esac
+    VC_NAME="veracrypt-console-$VERACRYPT_VERSION-Debian-13-$ARCH.deb"
+    MEGA_NAME="megacmd_$MEGACMD_VERSION""_$ARCH.deb"
+    curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 240 \
+        --output "$STAGE/$VC_NAME" "https://github.com/veracrypt/VeraCrypt/releases/download/VeraCrypt_$VERACRYPT_VERSION/$VC_NAME"
+    printf '%s  %s\n' "$VC_SHA" "$STAGE/$VC_NAME" | sha256sum --check --status
+    curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 240 \
+        --output "$STAGE/$MEGA_NAME" "https://mega.nz/linux/repo/Debian_13/$ARCH/$MEGA_NAME"
+    printf '%s  %s\n' "$MEGA_SHA" "$STAGE/$MEGA_NAME" | sha256sum --check --status
+    chmod 644 "$STAGE/$VC_NAME" "$STAGE/$MEGA_NAME"
+    apt-get install -y --no-remove exfatprogs fuse3 dmsetup "$STAGE/$VC_NAME" "$STAGE/$MEGA_NAME"
+    python3 -B "$SUPPORT_DIR/configure.py" backups "$CONFIG"
+    [[ ! -L /usr/local/lib/storypulse-backups ]] || exit 1
+    install -d -m 755 /usr/local/lib/storypulse-backups /usr/local/lib/storypulse-backups/storypulse_backups
+    printf '%s\n' 'StoryPulse installer backups v1' > /usr/local/lib/storypulse-backups/.storypulse-managed
+    chmod 600 /usr/local/lib/storypulse-backups/.storypulse-managed
+    [[ -f "$PROJECT_DIR/backups_service/run.py" && ! -L "$PROJECT_DIR/backups_service/run.py" ]] || exit 1
+    install -m 644 "$PROJECT_DIR/backups_service/run.py" /usr/local/lib/storypulse-backups/run.py
+    for source in "$PROJECT_DIR"/backups_service/storypulse_backups/*.py; do
+        [[ -f "$source" && ! -L "$source" ]] || exit 1
+        install -m 644 "$source" "/usr/local/lib/storypulse-backups/storypulse_backups/${source##*/}"
+    done
+    install -d -m 750 -o root -g "$RUN_GROUP" /var/lib/storypulse-backups
+    install -d -m 700 -o root -g root /var/lib/storypulse-backups/work /var/lib/storypulse-backups/mega
+    install -d -m 700 -o "$RUN_USER" -g "$RUN_GROUP" /var/spool/storypulse-backups
+    python3 -I -B /usr/local/lib/storypulse-backups/run.py --check
+    if [[ "$SKIP_START" == 0 ]]; then
+        python3 -I -B - <<'PY'
+import sys
+sys.path.insert(0, '/usr/local/lib/storypulse-backups')
+from pathlib import Path
+from storypulse_backups.core import credentials
+from storypulse_backups.adapters import CloudAdapter
+secret = credentials(Path('/etc/storypulse-backups/credentials.json'))
+try:
+    CloudAdapter().ensure_session(secret['mega_email'], secret['mega_password'])
+except Exception:
+    print('MEGA no confirmó el acceso. Los backups quedan sin activar; el bot continúa.', file=sys.stderr)
+    sys.exit(1)
+finally:
+    secret.clear()
 PY
-)"
-
-        "$FILEBROWSER_BIN" \
-            -d "$FB_DB" \
-            users add admin "$FB_PASSWORD_CREATED" \
-            --perm.admin
-
-        chown -R "$APP_USER:$APP_GROUP" "$FB_DB_DIR"
-        chmod 700 "$FB_DB_DIR"
-        chmod 600 "$FB_DB"
-    else
-        yellow "File Browser ya tenía base de datos. Se conservarán sus usuarios."
-        "$FILEBROWSER_BIN" \
-            -d "$FB_DB" \
-            config set \
-            --root "$STORAGE_DIR" \
-            --address "$FB_BIND" \
-            --port "$FB_PORT"
     fi
-
-    cat > "/etc/systemd/system/${FB_SERVICE_NAME}.service" <<EOF
+    cat > "$STAGE/storypulse-backups.service" <<'UNIT'
+# Managed by StoryPulse installer
 [Unit]
-Description=StoryPulse File Manager
+Description=StoryPulse encrypted history backups
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
-User=$APP_USER
-Group=$APP_GROUP
-ExecStart=$FILEBROWSER_BIN -d $FB_DB -r $STORAGE_DIR -a $FB_BIND -p $FB_PORT
+User=root
+Group=root
+WorkingDirectory=/usr/local/lib/storypulse-backups
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/storypulse-backups/run.py
+Environment=HOME=/var/lib/storypulse-backups/mega
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+TimeoutStopSec=infinity
+KillMode=mixed
+ProtectSystem=full
+ReadOnlyPaths=/historys
 NoNewPrivileges=true
-PrivateTmp=true
-
 [Install]
 WantedBy=multi-user.target
-EOF
-
+UNIT
+    install -m 644 "$STAGE/storypulse-backups.service" /etc/systemd/system/storypulse-backups.service
     systemctl daemon-reload
-    systemctl enable --now "${FB_SERVICE_NAME}.service"
-
-    if [[ "$FB_BIND" == "0.0.0.0" ]]; then
-        SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-        if [[ -n "$SERVER_IP" ]]; then
-            DEFAULT_PANEL_URL="http://${SERVER_IP}:${FB_PORT}/"
-        else
-            DEFAULT_PANEL_URL="http://SERVIDOR:${FB_PORT}/"
-        fi
+    if [[ "$SKIP_START" == 0 ]]; then systemctl enable --now storypulse-backups.service; fi
+)
+if [[ "$WANT_BACKUPS" == yes ]]; then
+    export STAGE ARCH VERACRYPT_VERSION MEGACMD_VERSION SUPPORT_DIR CONFIG PROJECT_DIR RUN_USER RUN_GROUP SKIP_START
+    export -f install_backups safe_path root_directory
+    if run_step 'Preparando backups cifrados y MEGA' bash -Eeuo pipefail -c install_backups; then
+        BACKUPS_RESULT='Preparados; credenciales en /etc/storypulse-backups/credentials.json (root:600)'
     else
-        DEFAULT_PANEL_URL="http://127.0.0.1:${FB_PORT}/"
+        BACKUPS_RESULT='Pendientes: falló MEGA o una dependencia opcional. El bot sigue instalado.'
+        printf '%s\n' "$BACKUPS_RESULT" >&2
     fi
-
-    echo
-    read -r -p "URL que querés usar en el botón del bot [$DEFAULT_PANEL_URL]: " PANEL_INPUT
-    PANEL_URL="${PANEL_INPUT:-$DEFAULT_PANEL_URL}"
-
-    green "✓ File Manager instalado sobre $STORAGE_DIR"
-else
-    blue "[6/9] File Manager omitido por el usuario."
-    echo
-    read -r -p "URL de un panel existente (opcional, ENTER para usar example.com): " PANEL_INPUT
-    PANEL_URL="${PANEL_INPUT:-https://example.com/}"
 fi
 
-# ------------------------------------------------------------
-# 9. CONFIGURACIÓN .env
-# ------------------------------------------------------------
-echo
-blue "[7/9] Configuración inicial de StoryPulse..."
-echo
-
-DEFAULT_TZ="UTC"
-if command -v timedatectl >/dev/null 2>&1; then
-    DETECTED_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
-    [[ -n "$DETECTED_TZ" ]] && DEFAULT_TZ="$DETECTED_TZ"
-elif [[ -f /etc/timezone ]]; then
-    DETECTED_TZ="$(head -n1 /etc/timezone 2>/dev/null || true)"
-    [[ -n "$DETECTED_TZ" ]] && DEFAULT_TZ="$DETECTED_TZ"
+install_filebrowser_optional() (
+    set -Eeuo pipefail
+    FB_HELPER="$SUPPORT_DIR/filebrowser-quantum.sh"
+    if [[ ! -f "$FB_HELPER" ]]; then
+        FB_HELPER="$STAGE/filebrowser-quantum.sh"
+        curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 90 \
+            --output "$FB_HELPER" 'https://raw.githubusercontent.com/FacuSecX/StoryPulse-Private/main/installer/filebrowser-quantum.sh'
+    fi
+    source "$FB_HELPER"
+    install_filebrowser_quantum "$RUN_USER" "$RUN_GROUP" /historys
+)
+if [[ "$WANT_FILEBROWSER" == yes ]]; then
+    export STAGE SUPPORT_DIR RUN_USER RUN_GROUP SKIP_START
+    export -f install_filebrowser_optional
+    if run_step 'Instalando FileBrowser Quantum' bash -Eeuo pipefail -c install_filebrowser_optional; then
+        FILEBROWSER_RESULT='Local: http://127.0.0.1:8085 (usar túnel SSH o proxy HTTPS)'
+    else
+        FILEBROWSER_RESULT='Pendiente: falló el paso opcional. El bot sigue instalado.'
+        printf 'FileBrowser: %s\n' "$FILEBROWSER_RESULT" >&2
+    fi
 fi
 
-read -r -s -p "Token del bot de Telegram (ENTER para configurar después): " TELEGRAM_TOKEN
-echo
-read -r -p "Telegram Chat ID autorizado (ENTER para configurar después): " TELEGRAM_CHAT_ID
-read -r -p "Zona horaria [$DEFAULT_TZ]: " STORYPULSE_TZ
-STORYPULSE_TZ="${STORYPULSE_TZ:-$DEFAULT_TZ}"
-
-cat > "$APP_DIR/.env" <<EOF
-# StoryPulse Private - Configuración local
-# NO subir este archivo a GitHub.
-
-TELEGRAM_BOT_TOKEN=$TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID
-INSTAGRAM_STORAGE_STATE=instagram_state.json
-INSTAGRAM_SESSIONS_CONFIG=sesiones_instagram.json
-INSTAGRAM_SESSIONS_REGISTRY=estado_sesiones_instagram.json
-HISTORYS_DIR=$STORAGE_DIR
-STORYPULSE_PANEL_URL=$PANEL_URL
-STORYPULSE_TIMEZONE=$STORYPULSE_TZ
-EOF
-
-chown "$APP_USER:$APP_GROUP" "$APP_DIR/.env"
-chmod 600 "$APP_DIR/.env"
-
-green "✓ .env creado"
-
-# ------------------------------------------------------------
-# 10. SERVICIO SYSTEMD STORYPULSE
-# ------------------------------------------------------------
-echo
-blue "[8/9] Creando servicio systemd..."
-
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+cat > "$STAGE/bot.service" <<UNIT
+# Managed by StoryPulse installer
 [Unit]
 Description=StoryPulse Private Telegram Bot
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
-User=$APP_USER
-Group=$APP_GROUP
-WorkingDirectory=$APP_DIR
+User=$RUN_USER
+Group=$RUN_GROUP
+WorkingDirectory=$PROJECT_DIR
 Environment=PYTHONUNBUFFERED=1
-Environment=PLAYWRIGHT_BROWSERS_PATH=$PW_DIR
-ExecStart=$VENV_DIR/bin/python $APP_DIR/bot.py
-Restart=always
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PLAYWRIGHT_BROWSERS_PATH=$BROWSERS_DIR
+ExecStart=$PYTHON_BIN -B $PROJECT_DIR/bot.py
+Restart=on-failure
 RestartSec=10
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=120
 NoNewPrivileges=true
 PrivateTmp=true
-
+UMask=0077
 [Install]
 WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}.service"
-
-if [[ -n "$TELEGRAM_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
-    systemctl restart "${SERVICE_NAME}.service"
-    green "✓ StoryPulse iniciado"
+UNIT
+install -m 644 "$STAGE/bot.service" "$SERVICE_FILE"
+run_step 'Verificando servicio del bot' systemd-analyze verify "$SERVICE_FILE"
+run_step 'Registrando servicio del bot' systemctl daemon-reload
+if [[ "$SKIP_START" == 0 ]]; then
+    run_step 'Habilitando servicio del bot' systemctl enable "$SERVICE_NAME.service"
+    run_step 'Iniciando servicio del bot' systemctl restart "$SERVICE_NAME.service"
+    sleep 3
+    systemctl is-active --quiet "$SERVICE_NAME.service" || die 'El bot no arrancó. Revisá su journal privado.'
 else
-    yellow "⚠ StoryPulse quedó instalado pero NO iniciado."
-    yellow "  Completá TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID en:"
-    yellow "  $APP_DIR/.env"
-    yellow "  Después ejecutá: systemctl start ${SERVICE_NAME}"
+    printf 'Modo de prueba: el bot y los backups quedaron preparados sin iniciar conexiones.\n'
 fi
-
-# ------------------------------------------------------------
-# 11. RESUMEN
-# ------------------------------------------------------------
-echo
-blue "[9/9] Instalación terminada"
-echo
-echo "============================================================"
-echo "                 INSTALACIÓN COMPLETADA"
-echo "============================================================"
-echo
-echo "Proyecto:"
-echo "  $APP_DIR"
-echo
-echo "Almacenamiento:"
-echo "  $STORAGE_DIR"
-echo
-echo "Entorno virtual:"
-echo "  $VENV_DIR"
-echo
-echo "Configuración privada:"
-echo "  $APP_DIR/.env"
-echo
-echo "Sesiones de Instagram (multi-autenticación):"
-echo "  Copiá sesiones_instagram.json y los JSON que referencia a:"
-echo "  $APP_DIR/"
-echo "  Conservá las rutas relativas, incluida la carpeta sesiones_instagram/."
-echo "  La sesión anterior instagram_state.json sigue siendo compatible."
-echo "  Los archivos de sesión y su configuración son privados; no van a GitHub."
-echo
-echo "Servicio StoryPulse:"
-echo "  systemctl status ${SERVICE_NAME}"
-echo "  journalctl -u ${SERVICE_NAME} -f"
-echo
-
-if [[ "$INSTALL_FB" == "s" || "$INSTALL_FB" == "si" || "$INSTALL_FB" == "sí" || "$INSTALL_FB" == "y" || "$INSTALL_FB" == "yes" ]]; then
-    echo "File Manager:"
-    echo "  Raíz: $STORAGE_DIR"
-    echo "  Escucha: $FB_BIND:$FB_PORT"
-    echo "  Servicio: ${FB_SERVICE_NAME}.service"
-    echo "  URL configurada: $PANEL_URL"
-    echo
-
-    if [[ -n "$FB_PASSWORD_CREATED" ]]; then
-        yellow "IMPORTANTE: credenciales iniciales del File Manager"
-        echo "  Usuario: admin"
-        echo "  Contraseña: $FB_PASSWORD_CREATED"
-        yellow "Guardá esta contraseña ahora. No se volverá a mostrar."
-        echo
-    fi
-fi
-
-yellow "IMPORTANTE:"
-echo "  Generá las sesiones en un equipo con interfaz gráfica, mediante login manual:"
-echo "    python crear_session.py"
-echo "  Eso crea la sesión principal compatible con la versión anterior."
-echo "  Para añadir otra cuenta autenticada:"
-echo "    python crear_session.py --cuenta USERNAME_DE_LA_CUENTA"
-echo "  Transferí sesiones_instagram.json y TODOS los archivos JSON habilitados"
-echo "  que referencia, conservando sus carpetas dentro de $APP_DIR."
-echo "  No transfieras los perfiles completos del navegador."
-echo "  Asigná sus permisos al usuario $APP_USER y limitá los JSON a chmod 600."
-echo "  El registro estado_sesiones_instagram.json se genera automáticamente."
-echo "  Reiniciá el bot tras copiar las sesiones: systemctl restart $SERVICE_NAME"
-echo "  crearsession.py se mantiene como acceso compatible a crear_session.py."
-echo
-green "StoryPulse Private v2.0 listo."
+printf '\nInstalación completada.\nProyecto: %s\nServicio: %s.service\nFileBrowser: %s\nBackups: %s\n' \
+    "$PROJECT_DIR" "$SERVICE_NAME" "$FILEBROWSER_RESULT" "$BACKUPS_RESULT"
+printf 'En Telegram: /start. Para consultar Instagram, creá tu sesión con CREAR_SESSION.bat o crear_session.py y transferila al proyecto.\n'
+printf 'No se abrieron puertos ni se modificaron Nginx, SSH o el firewall.\n'
+printf 'Registro detallado privado: %s\n' "$LOG_FILE"

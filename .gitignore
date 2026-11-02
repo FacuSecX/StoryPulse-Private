@@ -1,0 +1,44 @@
+# Entornos y archivos locales
+venv/
+.venv/
+.pw-browsers/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.local.json
+*.json
+!*.example.json
+*.log
+*.tmp
+*.part
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.ppk
+*.pem
+*.key
+# Sesiones, asociaciones, perfiles e historial privados
+/cuentas.json
+/sesiones_instagram.json
+/instagram_state*.json
+/estado_sesiones_instagram.json
+/user_ids_cache.json
+/sesiones_instagram/
+/perfiles_instagram/
+/perfil_instagram_playwright/
+/.renovacion_backup/
+/.eliminacion_session/
+/respaldos_codex/
+/historys/
+/prueba_descargas/
+/.backup-notices.json
+/.backup-notices.*.tmp
+/.navigation-state.json
+/..navigation-state.json.*.tmp
+# Nunca publicar contenedores ni credenciales del servidor
+/backup-*
+/credentials.json

@@ -1,7 +1,11 @@
-# StoryPulse v2.1
-# Created by FacuSecX https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
+# StoryPulse Private v3.0
+# Created by FacuSecX
+# https://github.com/FacuSecX/StoryPulse-Private
+# ==========================================
 
 from __future__ import annotations
+from job_fallback import scoped_operation
 
 import hashlib
 import json
@@ -21,7 +25,10 @@ from urllib.parse import urlencode, urlsplit
 
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
+from story_download_modes import (LoteHistorias, FalloPortada, MODOS_HISTORIAS,
+                                  PortadaNoDisponible, descargar_portada)
 from playwright.sync_api import sync_playwright
+from story_metadata import crear_contexto_historias, consultar_historias
 from instagram_sessions import (
     SinHistoriasDisponibles, PerfilPrivado, PerfilNoEncontrado,
     ErrorSesionInstagram, ErrorConsultaInstagram, comprobar_archivo_sesion, con_sesiones,
@@ -207,6 +214,7 @@ def _crear_contexto(playwright):
         timezone_id=ZONA_LOCAL,
     )
 
+    context._isolated_fallback_playwright = playwright
     return browser, context
 
 
@@ -257,21 +265,14 @@ def resolver_user_id(
                         return
 
                     try:
-                        ctype = (
-                            response.headers.get("content-type", "")
-                            or ""
-                        ).lower()
-
-                        if "json" not in ctype:
-                            return
-
-                        data = response.json()
+                        documentos = _datos_json_respuesta_recibida(response)
                     except Exception:
                         return
 
-                    for uid in _buscar_usuario_en_json(data, username):
-                        if uid not in candidatos:
-                            candidatos.append(uid)
+                    for data in documentos:
+                        for uid in _buscar_usuario_en_json(data, username):
+                            if uid not in candidatos:
+                                candidatos.append(uid)
 
                 page.on("response", procesar_response)
 
@@ -295,8 +296,6 @@ def resolver_user_id(
                 except Exception:
                     pass
 
-                # Conserva cualquier cookie/estado que Instagram haya
-                # actualizado durante esta navegación correcta.
                 _guardar_estado_contexto(
                     context
                 )
@@ -565,7 +564,7 @@ def _datos_json_respuesta_recibida(response) -> list[Any]:
         if posicion == len(texto):
             break
         if texto[posicion] not in "{[":
-            return []  # Nunca interpretar código JavaScript o valores sueltos.
+            return []
         try:
             valor, posicion = decoder.raw_decode(texto, posicion)
         except (ValueError, RecursionError):
@@ -608,8 +607,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
         recursos.update(sesion=actual, context=context, page=page, ultimo_estado=None)
 
         def solicitud_iniciada(request):
-            # Una respuesta tardía de la página anterior no pertenece al perfil
-            # actual, aunque su cuerpo incluya su nombre entre recomendaciones.
             solicitudes[request] = observacion["generacion"]
 
         def solicitud_terminada(request):
@@ -620,10 +617,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
             try:
                 origen = request.headers.get("referer", "")
                 url_origen = urlsplit(origen)
-                # Las peticiones al subdominio i.instagram.com pueden llevar
-                # sólo el origen por Referrer-Policy, sin la ruta del perfil.
-                # La generación sigue acotada a esta navegación y el frame
-                # aporta su ruta exacta, sin pedir ningún recurso adicional.
                 if not origen or (url_origen.hostname in ("instagram.com", "www.instagram.com")
                                   and not url_origen.path.rstrip("/")):
                     url_origen = urlsplit(str(request.frame.url))
@@ -645,8 +638,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
                     ))
                 for data in _datos_json_respuesta_recibida(response):
                     observacion["estados"].extend(_extraer_estado_perfil(data, objetivo))
-                    # Un recurso accesorio rechazado no invalida un perfil visible.
-                    # Se conserva el diagnóstico sólo si la página no confirma acceso.
                     try:
                         validar_datos_instagram(data)
                     except ErrorSesionInstagram as error:
@@ -674,7 +665,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
             f"https://www.instagram.com/{username}/",
             wait_until="domcontentloaded", timeout=60_000,
         )
-        # HTTP de la navegación y redirecciones reales sí detienen el lote.
         validar_respuesta_instagram(page, response, f"abrir el perfil de @{username}")
         limite = time.monotonic() + max(0.0, float(espera_maxima))
         while True:
@@ -723,8 +713,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
                     raise ErrorConsultaInstagram("Instagram mostró señales contradictorias de acceso al perfil.")
                 recordar_estado_sano()
                 raise PerfilPrivado(f"La sesión autenticada no tiene acceso a @{username}.")
-            # El perfil debe estar montado y autenticado. Metadatos aislados o
-            # recomendaciones no prueban que su página se haya mostrado.
             identidad = titulo_correcto and autenticado
             publicaciones_visibles = titulo_correcto and visual.get("publicaciones") is True
             if identidad and privado is True and siguiendo is False:
@@ -744,8 +732,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
             page.wait_for_timeout(250)
 
     def recordar_estado_sano():
-        # Sólo estado local del navegador. Si la siguiente página falla, se
-        # conserva este último estado correcto en lugar del interstitial final.
         try:
             recursos["ultimo_estado"] = recursos["context"].storage_state(indexed_db=True)
         except TypeError:
@@ -756,7 +742,6 @@ def comprobar_perfiles_desde_pagina(*, espera_maxima: float = 10.0):
     finally:
         try:
             if recursos and recursos["ultimo_estado"] is not None:
-                # El actualizador ya salió de usar_sesion al cerrar el manager.
                 with usar_sesion(recursos["sesion"]):
                     escribir_json_atomico(obtener_ruta_sesion(), recursos["ultimo_estado"])
         finally:
@@ -781,15 +766,13 @@ def _comprobar_perfil_desde_pagina(context, username: str, user_id: int, estados
                 return
             if int(response.status) == 429:
                 validar_respuesta_instagram(response, response, f"cargar el perfil de @{username}")
-            if "json" not in response.headers.get("content-type", "").lower():
-                return
-            data = response.json()
-            validar_datos_instagram(data)
-            estados.extend(_extraer_estado_perfil(data, username))
+            for data in _datos_json_respuesta_recibida(response):
+                validar_datos_instagram(data)
+                estados.extend(_extraer_estado_perfil(data, username))
         except ErrorSesionInstagram as error:
             errores_sesion.append(error)
         except Exception:
-            pass  # Recursos ajenos al perfil no determinan su acceso.
+            pass
 
     page.on("requestfinished", solicitud_terminada)
     try:
@@ -797,8 +780,6 @@ def _comprobar_perfil_desde_pagina(context, username: str, user_id: int, estados
         validar_respuesta_instagram(page, response, f"abrir @{username}")
         page.wait_for_timeout(2_000)
         validar_pagina_instagram(page)
-        # Primero aprovechar la página que ya se cargó. Un endpoint secundario
-        # no debe recibir otra petición si «Siguiendo» ya confirma el permiso.
         for intento in range(4):
             if errores_sesion:
                 raise errores_sesion[0]
@@ -844,7 +825,6 @@ def _comprobar_perfil_desde_pagina(context, username: str, user_id: int, estados
 
         if errores_sesion:
             raise errores_sesion[0]
-        # Sólo si la página sigue siendo indeterminada: una consulta alternativa.
         response_api = None
         try:
             response_api = context.request.get(
@@ -882,8 +862,6 @@ def comprobar_perfil_accesible(username: str, *, sin_historias: bool = False) ->
     """
     username = limpiar_username(username)
     comprobar_sesion_local()
-    # Resuelve el ID con el mecanismo existente. Si ya está en caché,
-    # esto no hace una consulta adicional.
     user_id = resolver_user_id(username)
 
     with _BLOQUEO:
@@ -905,25 +883,26 @@ def comprobar_perfil_accesible(username: str, *, sin_historias: bool = False) ->
                 except Exception:
                     try:
                         data = json.loads(page.locator("body").inner_text())
-                    except Exception as error:
-                        raise ErrorConsultaInstagram(
-                            "Instagram no devolvió JSON válido al verificar "
-                            f"@{username}."
-                        ) from error
+                    except Exception:
+                        data = None
 
-                validar_datos_instagram(data)
-
-                if not isinstance(data, dict):
+                if data is None:
+                    documentos = _datos_json_respuesta_recibida(response)
+                elif isinstance(data, dict):
+                    documentos = [data]
+                else:
                     raise ErrorConsultaInstagram(
                         f"Instagram devolvió una respuesta inválida para @{username}."
                     )
 
-                if data.get("errors"):
-                    raise ErrorConsultaInstagram(
-                        f"Instagram devolvió un error GraphQL para @{username}."
-                    )
-
-                estados = _extraer_estado_perfil(data, username)
+                estados = []
+                for documento in documentos:
+                    validar_datos_instagram(documento)
+                    if isinstance(documento, dict) and documento.get("errors"):
+                        raise ErrorConsultaInstagram(
+                            f"Instagram devolvió un error GraphQL para @{username}."
+                        )
+                    estados.extend(_extraer_estado_perfil(documento, username))
 
                 es_privado, siguiendo = _resumir_estado_perfil(estados, username, user_id)
                 if (es_privado is None and siguiendo is not True) or (es_privado and siguiendo is None):
@@ -963,7 +942,6 @@ def comprobar_perfil_accesible(username: str, *, sin_historias: bool = False) ->
                 browser.close()
 
 
-# Alias de compatibilidad con versiones antiguas.
 def comprobar_perfil_publico(username: str) -> dict[str, Any]:
     return comprobar_perfil_accesible(username)
 
@@ -1041,7 +1019,6 @@ def _taken_at(item: dict[str, Any]) -> datetime | None:
         try:
             numero = float(valor)
 
-            # algunos IDs/fechas pueden venir en milisegundos
             if numero > 10_000_000_000:
                 numero /= 1000.0
 
@@ -1110,18 +1087,24 @@ def _construir_url_stories(user_id: int) -> str:
     )
 
 
+@scoped_operation
 @con_sesiones()
 def descargar_historias(
     username: str,
     user_id: int | None = None,
+    *,
+    modo_descarga: str = "normal",
+    omitir_historia=None,
 ) -> list[HistoriaDescargada]:
     """
-    Consulta las Stories mediante Instagram Web GraphQL y descarga
+    Consulta las Stories mediante lectura autenticada directa y descarga
     imagen/video directamente desde CDN.
 
     No abre el visor normal de Stories y no realiza ninguna llamada
     deliberada para marcarlas como vistas.
     """
+    if modo_descarga not in MODOS_HISTORIAS:
+        raise ValueError("Modo de descarga de historias inválido.")
     username = limpiar_username(username)
 
     with _BLOQUEO:
@@ -1137,64 +1120,9 @@ def descargar_historias(
                 cache[username] = user_id
                 _guardar_cache(cache)
 
-        url_graphql = _construir_url_stories(user_id)
-
         with usar_playwright_sincronico(sync_playwright) as p:
-            browser, context = _crear_contexto(p)
-
-            try:
-                page = context.new_page()
-
-                response = page.goto(
-                    url_graphql,
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-
-                validar_respuesta_instagram(page, response, f"consultar Stories de @{username}")
-
-                try:
-                    data = response.json()
-                except Exception:
-                    texto = page.locator("body").inner_text()
-                    try:
-                        data = json.loads(texto)
-                    except Exception as error:
-                        raise ErrorConsultaInstagram(
-                            "Instagram no devolvió JSON válido en Stories."
-                        ) from error
-
-                validar_datos_instagram(data)
-                reels = _buscar_reels_media(data)
-
-                if reels is None:
-                    raise ErrorConsultaInstagram(
-                        "La respuesta de Instagram no contiene reels_media. "
-                        "Es posible que Instagram haya cambiado el endpoint/query_hash."
-                    )
-
-                if not reels:
-                    # Un privado inaccesible también puede responder con reels vacíos.
-                    comprobar_perfil_accesible(username)
-                    raise SinHistoriasDisponibles(
-                        f"@{username} no tiene historias visibles actualmente."
-                    )
-
-                items: list[dict[str, Any]] = []
-
-                for reel in reels:
-                    if not isinstance(reel, dict):
-                        continue
-
-                    reel_items = reel.get("items") or []
-
-                    if isinstance(reel_items, list):
-                        items.extend(
-                            item
-                            for item in reel_items
-                            if isinstance(item, dict)
-                        )
-
+            with crear_contexto_historias(p, obtener_ruta_sesion()) as context:
+                items = consultar_historias(context, username, user_id)
                 if not items:
                     comprobar_perfil_accesible(username)
                     raise SinHistoriasDisponibles(
@@ -1209,7 +1137,7 @@ def descargar_historias(
                     )
                 )
 
-                resultado: list[HistoriaDescargada] = []
+                resultado = LoteHistorias() if modo_descarga == "portada" else []
 
                 for item in items:
                     story_pk = str(
@@ -1219,6 +1147,37 @@ def descargar_historias(
                     )
 
                     if not story_pk:
+                        continue
+
+                    if modo_descarga == "portada":
+                        if omitir_historia is not None and omitir_historia(story_pk):
+                            resultado.omitidas += 1
+                            continue
+
+                        def obtener_imagen(url):
+                            media = context.request.get(
+                                url, headers={"Referer": "https://www.instagram.com/", "Accept": "image/*"},
+                                timeout=60_000, fail_on_status_code=False,
+                            )
+                            try:
+                                if not media.ok:
+                                    raise PortadaNoDisponible("No se pudo descargar la imagen de portada.")
+                                if media.headers.get("content-type", "").lower().startswith("video/"):
+                                    raise PortadaNoDisponible("Instagram entregó un video en lugar de una portada.")
+                                return media.body()
+                            finally:
+                                media.dispose()
+
+                        try:
+                            portada = descargar_portada(item, obtener_imagen)
+                        except PortadaNoDisponible as error:
+                            resultado.fallos_portada.append(FalloPortada(story_pk, str(error)))
+                            continue
+                        resultado.append(HistoriaDescargada(
+                            story_pk=story_pk, username=username, contenido=portada.contenido,
+                            content_type="image/jpeg", extension="jpg", ancho=portada.ancho, alto=portada.alto,
+                            tomada_en=_taken_at(item), hash_archivo=f"igpk:{story_pk}", es_video=False,
+                        ))
                         continue
 
                     video = _video_url(item)
@@ -1290,22 +1249,18 @@ def descargar_historias(
                         )
                     )
 
-                if not resultado:
+                if not resultado and not (modo_descarga == "portada" and
+                                          (resultado.fallos_portada or resultado.omitidas)):
                     raise SinHistoriasDisponibles(
                         f"@{username} no tiene historias descargables actualmente."
                     )
 
-                # La operación terminó bien: persistimos el estado web
-                # más reciente para futuras revisiones.
                 _guardar_estado_contexto(
                     context
                 )
 
                 return resultado
 
-            finally:
-                context.close()
-                browser.close()
 
 
 def descargar_imagenes(
